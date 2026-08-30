@@ -4,6 +4,23 @@ The version is a human judgment, bumped deliberately inside the change that
 will be published — it is never derived mechanically from commit types — and
 `--version` must discriminate any two published trees. Newest first.
 
+## 0.1.1
+
+Documentation only; no behaviour changes.
+
+**Onboarding starts from what the session loaded.** §5 of the onboarding
+prompt now has the agent state which instruction files its session
+actually loaded, and partitions three topologies: a repository
+instruction file is repaired in place; a session that loaded only
+user-level or machine-global rules proposes a minimal repository
+instruction file rather than routing project facts into a private global
+file that travels with nobody; and a session that loaded nothing
+proposes the same file. In both repository-absent branches the proposal
+carries only the operating floor: the five §5 repairs plus one line of
+commit discipline (work on the agreed branch, commit logical units, push
+only on the owner's explicit request). Nothing else is injected;
+language rules, roles and house style stay the owner's.
+
 ## 0.1.0
 
 First publication. The version was declared before anyone could install the

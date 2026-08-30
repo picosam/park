@@ -147,6 +147,35 @@ an agent here loads, make these true:
 Then delete or rewrite anything else the migration made stale, including
 pointers to files that no longer hold what they claim.
 
+**Required too — notice what the agents here load at all.** State which
+instruction files this session actually loaded: the repository's own, and
+any user-level or machine-global rules your agent surface reads (for
+Claude Code `~/.claude/CLAUDE.md`, for Codex `~/.codex/AGENTS.md`; name
+your surface's equivalent). Declare it from the session; do not probe
+other machines' filesystems — absence here is not absence everywhere.
+Three topologies, three different answers:
+
+- **The repository carries an instruction file** — with or without
+  global rules loaded beside it: the repair list above has its home;
+  make it true there.
+- **No repository instruction file, but the session loaded user-level or
+  machine-global rules.** Do not send repository facts there — a global
+  file does not travel with the clone, a collaborator or a different
+  agent surface never sees it, and project policy would pollute one
+  person's private defaults. Propose — as a diff the owner agrees to — a
+  minimal repository instruction file carrying only the operating floor:
+  the five repairs above (they are the floor for a backlog repository),
+  plus one line of commit discipline — work on the agreed branch, commit
+  logical units, push only on the owner's explicit request. Global rules
+  keep covering only what is genuinely generic (tone, language, personal
+  style).
+- **Nothing is loaded anywhere.** Propose the same minimal repository
+  file with the same floor; it is the whole contract until the owner
+  grows it.
+
+Nothing else is injected in either repository-absent branch: no language
+rules, no roles, no house style — those are the owner's to add or not.
+
 **Offered, and bounded — the optimization pass.** While you are in these
 files, *propose* improvements against these criteria — the ones that make an
 instruction file cheap to load and hard to get wrong:

@@ -49,7 +49,7 @@ from pathlib import Path
 # deliberately inside the change that will be published — never derived
 # mechanically from commit types — and --version must discriminate any two
 # published trees.
-PARK_VERSION = "0.1.0"
+PARK_VERSION = "0.1.1"
 
 def find_root() -> Path:
     """The nearest ancestor (working directory upward) carrying `briefs/`.
