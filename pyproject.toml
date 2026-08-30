@@ -1,0 +1,26 @@
+# Packaging metadata for the published tree. This file backs exactly one of
+# the advertised install paths — `uvx --from git+<this repository> park` —
+# which builds a wheel from the checkout and needs metadata to find the
+# executable. The copy-one-file path does not read it.
+#
+# The tool is one script with no importable module, so the executable is
+# declared as a script file rather than a console entry point, and the
+# version cannot be read dynamically from the code: it is restated here and
+# a workbench test refuses any drift between this value and PARK_VERSION in
+# bin/park.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "park"
+version = "0.1.0"
+description = "A backlog format for AI coding agents: one topic per file, machine-checked blockers, a compiled index read on demand"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools]
+script-files = ["bin/park"]

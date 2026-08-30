@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""park — validate the briefs tree and compile the TODO.md index.
+
+    bin/park validate            validate every brief under briefs/
+    bin/park map                 validate, then regenerate TODO.md's
+                                 generated region in place
+    bin/park map --check         validate and compare; non-zero when the
+                                 region on disk disagrees with the briefs
+
+Exit 0 clean; 1 on a validation failure or drift; 2 on usage.
+
+The repository root is the nearest directory at or above the working
+directory that carries `briefs/` — resolved from where park is RUN, never
+from where it is installed, so a copy on PATH or a `uvx` install works on
+whatever repository you are standing in.
+
+The schema: YAML frontmatter carrying exactly the fields id / type /
+status / owner / gate / triggers / brief, with closed vocabularies, and
+gates expressed as brief ids rather than prose (the one prose form is
+"manual: <checkable fact>", which is unresolvable by design and treated
+as such). The parser accepts precisely that subset — plain scalars,
+inline `[a, b]` lists, block `- item` lists — and refuses anything else
+naming the offending field. There is deliberately no YAML library:
+standard library only, so the tool is one file with no dependencies.
+
+The one semantic check is the reason gates are ids and not prose: a
+`parked` brief whose gates ALL resolve to done/superseded briefs is
+reported as gate-opened — work that is unblocked while still filed as
+blocked, which is invisible in any format whose blockers are sentences.
+A `manual:` gate blocks that conclusion, and an empty gate list is
+parked-on-nothing, which is legal (an undated park), not opened.
+
+The index's generated region runs from the top of the file to the END
+marker; anything below the marker is preserved untouched, which is what
+lets a migration run in batches with both systems true at every step.
+Once nothing is left below the marker, the whole file is generated.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# Declared from the first commit rather than added at publication: the sibling
+# review tool shipped two releases whose `--version` could not tell them apart,
+# because the constant arrived after the second one. A version is cheap before
+# anyone installs it and a behaviour change afterwards.
+#
+# The rule this constant lives under: the version is a human judgment, bumped
+# deliberately inside the change that will be published — never derived
+# mechanically from commit types — and --version must discriminate any two
+# published trees.
+PARK_VERSION = "0.1.0"
+
+def find_root() -> Path:
+    """The nearest ancestor (working directory upward) carrying `briefs/`.
+
+    Resolved from the working directory, not the script's location: a park
+    installed on PATH or run through `uvx` sits nowhere near the repository
+    it is asked about. Falls back to the working directory itself, so the
+    missing-briefs refusal names the place park actually looked.
+    """
+    cwd = Path.cwd().resolve()
+    for candidate in (cwd, *cwd.parents):
+        if (candidate / "briefs").is_dir():
+            return candidate
+    return cwd
+
+
+ROOT = find_root()
+BRIEFS = ROOT / "briefs"
+TODO = ROOT / "TODO.md"
+
+TYPES = {"task", "decision", "watch", "record", "procedure"}
+STATUSES = {"open", "parked", "done", "superseded"}
+OWNERS = {"user", "agent"}
+FIELDS = ("id", "type", "status", "owner", "gate", "triggers", "brief")
+LIST_FIELDS = {"gate", "triggers"}
+END_MARK = "<!-- END GENERATED park map -->"
+
+
+def _unquote(value: str) -> str:
+    """Strip one pair of matching surrounding quotes, if present."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+def parse_front(path: Path, errors: list[str]) -> dict | None:
+    """Parse one brief's frontmatter into a dict, or None on failure.
+
+    Accepts the ratified subset only: `key: scalar`, `key: [a, b]`, and
+    `key:` followed by `  - item` lines, between two `---` fences.
+    """
+    rel = path.relative_to(ROOT)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        errors.append(f"{rel}: unreadable ({exc})")
+        return None
+    if not lines or lines[0].strip() != "---":
+        errors.append(f"{rel}: no frontmatter — first line must be ---")
+        return None
+    data: dict = {}
+    pending_list: str | None = None
+    closed = False
+    for n, raw in enumerate(lines[1:], start=2):
+        line = raw.rstrip()
+        if line.strip() == "---":
+            closed = True
+            body = "\n".join(lines[n:]).strip()
+            data["_body"] = body
+            break
+        if line.startswith("  - ") or line.startswith("- "):
+            if pending_list is None:
+                errors.append(f"{rel}:{n}: list item outside a list field")
+                return None
+            item = _unquote(line.split("- ", 1)[1].strip())
+            if not item:
+                errors.append(f"{rel}:{n}: empty list item")
+                return None
+            data[pending_list].append(item)
+            continue
+        if line.strip().startswith("#") or not line.strip():
+            continue
+        pending_list = None
+        key, sep, value = line.partition(":")
+        key = key.strip()
+        if not sep or key != key.lstrip():
+            errors.append(f"{rel}:{n}: not a `key: value` line: {line!r}")
+            return None
+        if key not in FIELDS:
+            errors.append(f"{rel}:{n}: unknown field {key!r} "
+                          f"(schema fields: {', '.join(FIELDS)})")
+            return None
+        if key in data:
+            errors.append(f"{rel}:{n}: duplicate field {key!r}")
+            return None
+        value = value.strip()
+        if key in LIST_FIELDS:
+            if value == "":
+                data[key] = []
+                pending_list = key
+            elif value == "[]":
+                data[key] = []
+            elif value.startswith("[") and value.endswith("]"):
+                inner = value[1:-1].strip()
+                data[key] = ([] if not inner
+                             else [_unquote(v.strip())
+                                   for v in inner.split(",")])
+            else:
+                errors.append(f"{rel}:{n}: {key} must be a list "
+                              f"([] / [a, b] / block form), got {value!r}")
+                return None
+        else:
+            data[key] = _unquote(value)
+    if not closed:
+        errors.append(f"{rel}: frontmatter never closed with ---")
+        return None
+    for field in FIELDS:
+        if field not in data:
+            errors.append(f"{rel}: missing required field {field!r}")
+    if any(e.startswith(f"{rel}: missing") for e in errors):
+        return None
+    return data
+
+
+def load_briefs(errors: list[str]) -> dict[str, dict]:
+    if not BRIEFS.is_dir():
+        errors.append(f"{BRIEFS.relative_to(ROOT)}/: directory does not exist")
+        return {}
+    briefs: dict[str, dict] = {}
+    for path in sorted(BRIEFS.glob("*.md")):
+        rel = path.relative_to(ROOT)
+        data = parse_front(path, errors)
+        if data is None:
+            continue
+        bid = data["id"]
+        if bid != path.stem:
+            errors.append(f"{rel}: id {bid!r} does not match filename "
+                          f"stem {path.stem!r} (one brief, one file, one id)")
+            continue
+        if bid in briefs:
+            errors.append(f"{rel}: duplicate id {bid!r}")
+            continue
+        data["_path"] = rel
+        briefs[bid] = data
+    return briefs
+
+
+def validate(briefs: dict[str, dict], errors: list[str]) -> None:
+    for bid, b in sorted(briefs.items()):
+        rel = b["_path"]
+        if b["type"] not in TYPES:
+            errors.append(f"{rel}: type {b['type']!r} not in "
+                          f"{sorted(TYPES)}")
+        if b["status"] not in STATUSES:
+            errors.append(f"{rel}: status {b['status']!r} not in "
+                          f"{sorted(STATUSES)}")
+        if b["owner"] not in OWNERS:
+            errors.append(f"{rel}: owner {b['owner']!r} not in "
+                          f"{sorted(OWNERS)}")
+        if not b["brief"]:
+            errors.append(f"{rel}: brief is empty — it is the map line")
+        if b["type"] == "watch":
+            # The decided looseness: a watch is armed, not worked — it
+            # carries status: open plus at least one trigger.
+            if b["status"] != "open":
+                errors.append(f"{rel}: a watch carries status: open "
+                              f"(got {b['status']!r})")
+            if not b["triggers"]:
+                errors.append(f"{rel}: a watch needs at least one trigger")
+        resolved = []
+        for g in b["gate"]:
+            if g.startswith("manual:"):
+                if not g[len("manual:"):].strip():
+                    errors.append(f"{rel}: gate 'manual:' carries no "
+                                  f"checkable fact")
+                resolved.append(None)  # unresolvable by design
+                continue
+            if g == bid:
+                errors.append(f"{rel}: gate references the brief itself")
+                continue
+            if g not in briefs:
+                errors.append(f"{rel}: gate {g!r} resolves to no brief")
+                continue
+            resolved.append(briefs[g]["status"])
+        # §3 refinement 1: the gate-opened pathology, mechanically.
+        if (b["status"] == "parked" and b["gate"]
+                and all(s in ("done", "superseded") for s in resolved)
+                and None not in resolved
+                and len(resolved) == len(b["gate"])):
+            closed_gates = ", ".join(
+                f"{g}: {briefs[g]['status']}" for g in b["gate"])
+            errors.append(f"{rel}: status parked but every gate is closed "
+                          f"({closed_gates}) — the gate has opened; "
+                          f"work it or re-park it on a real gate")
+
+
+def render_map(briefs: dict[str, dict]) -> str:
+    def line(b: dict, with_gate: bool) -> str:
+        head = (f"- [`{b['id']}`](briefs/{b['id']}.md) "
+                f"({b['type']}, {b['owner']})")
+        if with_gate and b["gate"]:
+            head += f" gate: {', '.join(b['gate'])}"
+        return f"{head} — {b['brief']}"
+
+    open_items = [b for b in briefs.values()
+                  if b["status"] == "open" and b["type"] != "watch"]
+    watches = [b for b in briefs.values() if b["type"] == "watch"]
+    parked = [b for b in briefs.values() if b["status"] == "parked"]
+    records = [b for b in briefs.values()
+               if b["status"] in ("done", "superseded")
+               and b["type"] != "watch"]
+    for group in (open_items, watches, parked, records):
+        group.sort(key=lambda b: b["id"])
+
+    out = ["# TODO — brief index", ""]
+    out += [
+        "<!-- GENERATED by park from briefs/*.md — do not edit this region",
+        "     by hand; edit the briefs and run `park map`. `park map",
+        "     --check` guards it. -->",
+        "",
+        "The backlog lives in `briefs/` — one topic per file, frontmatter",
+        "`id/type/status/owner/gate/triggers/brief`. This index is for",
+        "ROUTING: read ONE brief on demand, never the whole tree.",
+        "",
+    ]
+    # Named only where it exists: the archive is this repository's choice,
+    # not something the tool creates or can assume. A generated index that
+    # points at a file the repository does not have is the drift this tool
+    # is for, produced by the tool itself.
+    archive = TODO.with_name(f"{TODO.stem}-archive{TODO.suffix}")
+    if archive.is_file():
+        out += [f"The closed record is `{archive.name}` — grep it, do not "
+                f"load it per-session.", ""]
+    sections = [
+        ("Open — actionable now", open_items, True),
+        ("Watches — armed triggers", watches, False),
+        ("Parked — waiting on a gate", parked, True),
+        ("Records — closed, load-bearing", records, False),
+    ]
+    for title, group, with_gate in sections:
+        out.append(f"## {title} ({len(group)})")
+        out.append("")
+        for b in group:
+            out.append(line(b, with_gate))
+        if group:
+            out.append("")
+    out.append(END_MARK)
+    return "\n".join(out) + "\n"
+
+
+def split_todo(text: str) -> tuple[str | None, str]:
+    """Return (generated_head, preserved_tail); head None when unmarked."""
+    if END_MARK not in text:
+        return None, text
+    head, _, tail = text.partition(END_MARK)
+    return head + END_MARK + "\n", tail.lstrip("\n")
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="park")
+    parser.add_argument("--version", action="version",
+                        version=f"park {PARK_VERSION}")
+    sub = parser.add_subparsers(dest="verb", required=True)
+    sub.add_parser("validate")
+    p_map = sub.add_parser("map")
+    p_map.add_argument("--check", action="store_true",
+                       help="compare instead of writing; non-zero on drift")
+    args = parser.parse_args(argv)
+
+    errors: list[str] = []
+    briefs = load_briefs(errors)
+    validate(briefs, errors)
+    if errors:
+        for e in errors:
+            print(e, file=sys.stderr)
+        print(f"park: {len(errors)} error(s) in "
+              f"{len(briefs)} parsed brief(s)", file=sys.stderr)
+        return 1
+    if args.verb == "validate":
+        print(f"park: {len(briefs)} briefs valid")
+        return 0
+
+    rendered = render_map(briefs)
+    current = TODO.read_text(encoding="utf-8") if TODO.is_file() else ""
+    head, tail = split_todo(current)
+    want = rendered + ("\n" + tail if tail else "")
+    if args.check:
+        if head is None:
+            print(f"park: {TODO.name} carries no generated region "
+                  f"(marker {END_MARK!r} absent) — run `bin/park map`",
+                  file=sys.stderr)
+            return 1
+        if current != want:
+            print(f"park: {TODO.name} is stale against briefs/ — "
+                  f"run `bin/park map`", file=sys.stderr)
+            return 1
+        print(f"park: map current ({len(briefs)} briefs)")
+        return 0
+    if current == want:
+        print(f"park: map already current ({len(briefs)} briefs)")
+        return 0
+    TODO.write_text(want, encoding="utf-8")
+    print(f"park: map written ({len(briefs)} briefs)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

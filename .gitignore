@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+# What a wheel build (`uv build`, `pip wheel .`) leaves in the tree when run
+# in-tree; this tree carries pyproject.toml, so that can happen here.
+build/
+dist/
+*.egg-info/
+# The private extractor marks every tree it generates so it can recognise
+# one before replacing it. Ignored so the marker never becomes a tracked
+# file of the published tree.
+.loupe-generated
