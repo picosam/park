@@ -49,7 +49,7 @@ from pathlib import Path
 # deliberately inside the change that will be published — never derived
 # mechanically from commit types — and --version must discriminate any two
 # published trees.
-PARK_VERSION = "0.1.1"
+PARK_VERSION = "0.2.0"
 
 def find_root() -> Path:
     """The nearest ancestor (working directory upward) carrying `briefs/`.
@@ -248,10 +248,10 @@ def render_map(briefs: dict[str, dict]) -> str:
                   if b["status"] == "open" and b["type"] != "watch"]
     watches = [b for b in briefs.values() if b["type"] == "watch"]
     parked = [b for b in briefs.values() if b["status"] == "parked"]
-    records = [b for b in briefs.values()
-               if b["status"] in ("done", "superseded")
-               and b["type"] != "watch"]
-    for group in (open_items, watches, parked, records):
+    closed = [b for b in briefs.values()
+              if b["status"] in ("done", "superseded")
+              and b["type"] != "watch"]
+    for group in (open_items, watches, parked):
         group.sort(key=lambda b: b["id"])
 
     out = ["# TODO — brief index", ""]
@@ -263,6 +263,13 @@ def render_map(briefs: dict[str, dict]) -> str:
         "The backlog lives in `briefs/` — one topic per file, frontmatter",
         "`id/type/status/owner/gate/triggers/brief`. This index is for",
         "ROUTING: read ONE brief on demand, never the whole tree.",
+        "",
+        "This map is ACTIVE-ONLY. Closed briefs stay validated, linkable and",
+        "gate-resolvable; they are not rendered here, because this file is",
+        "for choosing the next piece of work. To reach them:",
+        "",
+        "    rg -l '^status: (done|superseded)$' briefs   # list them",
+        "    rg <term> briefs                             # search all bodies",
         "",
     ]
     # Named only where it exists: the archive is this repository's choice,
@@ -277,7 +284,6 @@ def render_map(briefs: dict[str, dict]) -> str:
         ("Open — actionable now", open_items, True),
         ("Watches — armed triggers", watches, False),
         ("Parked — waiting on a gate", parked, True),
-        ("Records — closed, load-bearing", records, False),
     ]
     for title, group, with_gate in sections:
         out.append(f"## {title} ({len(group)})")
@@ -286,6 +292,8 @@ def render_map(briefs: dict[str, dict]) -> str:
             out.append(line(b, with_gate))
         if group:
             out.append("")
+    out.append(f"{len(closed)} closed brief(s) are not listed above.")
+    out.append("")
     out.append(END_MARK)
     return "\n".join(out) + "\n"
 

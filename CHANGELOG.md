@@ -4,6 +4,35 @@ The version is a human judgment, bumped deliberately inside the change that
 will be published — it is never derived mechanically from commit types — and
 `--version` must discriminate any two published trees. Newest first.
 
+## 0.2.0
+
+**The map is active-only.** `park map` renders open, watch and parked
+briefs. Briefs with `status: done` or `status: superseded` are still
+parsed, still validated and still resolvable as another brief's gate —
+they are simply no longer rendered as routing lines, because the map is
+read to choose the next piece of work, and a closed record answers a
+different question.
+
+Measured in the repository this tool was built for: the closed section was
+41.6% of the generated map (8,578 of 20,636 bytes, 30 of 72 items) and no
+test, gate, script or document read it.
+
+The omission is stated, not silent: the generated region ends with a count
+of the briefs it did not list, and that line is inside the guarded region,
+so `park map --check` refuses a hand edit of it like any other drift.
+
+Closed briefs stay discoverable with the primitives you already have, and
+term search gets strictly better — it reaches whole brief bodies, not just
+the one-line summaries the map carried:
+
+    rg -l '^status: (done|superseded)$' briefs
+    rg <term> briefs
+
+The map's preamble carries both commands, so nobody has to remember them.
+
+Behaviour change, not a breaking one: no input is refused that was
+accepted before, and every brief a 0.1.x tree validated still validates.
+
 ## 0.1.1
 
 Documentation only; no behaviour changes.
