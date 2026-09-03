@@ -15,20 +15,31 @@ from where it is installed, so a copy on PATH or a `uvx` install works on
 whatever repository you are standing in.
 
 The schema: YAML frontmatter carrying exactly the fields id / type /
-status / owner / gate / triggers / brief, with closed vocabularies, and
-gates expressed as brief ids rather than prose (the one prose form is
-"manual: <checkable fact>", which is unresolvable by design and treated
-as such). The parser accepts precisely that subset — plain scalars,
-inline `[a, b]` lists, block `- item` lists — and refuses anything else
-naming the offending field. There is deliberately no YAML library:
-standard library only, so the tool is one file with no dependencies.
+status / owner / gate / triggers / deferrals / brief, with closed
+vocabularies, and gates expressed as brief ids rather than prose (the one
+prose form is "manual: <checkable fact>", which is unresolvable by design
+and treated as such). `deferrals` names, as a list of ids, any prior
+decision this brief is the live destination for — the durable, structural
+answer to "where did that deferred item go" that used to be answered by
+scanning prose for a checkbox next to the id (brief
+deferral-guard-resolves-structurally). The parser accepts precisely that
+subset — plain scalars, inline `[a, b]` lists, block `- item` lists — and
+refuses anything else naming the offending field. There is deliberately no
+YAML library: standard library only, so the tool is one file with no
+dependencies.
 
-The one semantic check is the reason gates are ids and not prose: a
-`parked` brief whose gates ALL resolve to done/superseded briefs is
-reported as gate-opened — work that is unblocked while still filed as
-blocked, which is invisible in any format whose blockers are sentences.
-A `manual:` gate blocks that conclusion, and an empty gate list is
-parked-on-nothing, which is legal (an undated park), not opened.
+Two semantic checks follow from treating blockers and destinations as ids
+rather than prose. First, the reason gates are ids: a `parked` brief whose
+gates ALL resolve to done/superseded briefs is reported as gate-opened —
+work that is unblocked while still filed as blocked, which is invisible in
+any format whose blockers are sentences. A `manual:` gate blocks that
+conclusion, and an empty gate list is parked-on-nothing, which is legal (an
+undated park), not opened. Second, the reason deferrals are ids: the same
+id claimed by two briefs' `deferrals` is an ambiguous destination — a
+question a prose scan could not even ask, since two documents can both
+mention the same words. An empty deferrals list is the common case (a
+brief that resolves nothing); every non-empty entry must be unique across
+the whole tree.
 
 The index's generated region runs from the top of the file to the END
 marker; anything below the marker is preserved untouched, which is what
@@ -49,7 +60,7 @@ from pathlib import Path
 # deliberately inside the change that will be published — never derived
 # mechanically from commit types — and --version must discriminate any two
 # published trees.
-PARK_VERSION = "0.2.0"
+PARK_VERSION = "0.3.0"
 
 def find_root() -> Path:
     """The nearest ancestor (working directory upward) carrying `briefs/`.
@@ -73,8 +84,14 @@ TODO = ROOT / "TODO.md"
 TYPES = {"task", "decision", "watch", "record", "procedure"}
 STATUSES = {"open", "parked", "done", "superseded"}
 OWNERS = {"user", "agent"}
-FIELDS = ("id", "type", "status", "owner", "gate", "triggers", "brief")
-LIST_FIELDS = {"gate", "triggers"}
+FIELDS = ("id", "type", "status", "owner", "gate", "triggers", "deferrals",
+          "brief")
+LIST_FIELDS = {"gate", "triggers", "deferrals"}
+# Fields a brief may omit, and what omission means. `deferrals` arrived in
+# 0.3.0; making it required would break every 0.2.x tree on upgrade for a
+# field whose common value is empty. Absent reads as "this brief is nobody's
+# deferral destination", which is exactly what `[]` says.
+OPTIONAL_DEFAULTS = {"deferrals": ()}
 END_MARK = "<!-- END GENERATED park map -->"
 
 
@@ -158,6 +175,9 @@ def parse_front(path: Path, errors: list[str]) -> dict | None:
         return None
     for field in FIELDS:
         if field not in data:
+            if field in OPTIONAL_DEFAULTS:
+                data[field] = list(OPTIONAL_DEFAULTS[field])
+                continue
             errors.append(f"{rel}: missing required field {field!r}")
     if any(e.startswith(f"{rel}: missing") for e in errors):
         return None
@@ -234,6 +254,23 @@ def validate(briefs: dict[str, dict], errors: list[str]) -> None:
             errors.append(f"{rel}: status parked but every gate is closed "
                           f"({closed_gates}) — the gate has opened; "
                           f"work it or re-park it on a real gate")
+
+    # §3 refinement 2: a deferral destination must be unresolvable in only
+    # one direction. Two briefs both claiming the same id is not a lost
+    # destination, it is an AMBIGUOUS one — a question prose adjacency
+    # could never even ask, since nothing stopped two documents mentioning
+    # the same words. Checked once, across the whole tree, because the
+    # defect is between briefs rather than inside any single one.
+    claimed_by: dict[str, list[str]] = {}
+    for bid, b in sorted(briefs.items()):
+        for d in b["deferrals"]:
+            claimed_by.setdefault(d, []).append(bid)
+    for d, owners in sorted(claimed_by.items()):
+        if len(owners) > 1:
+            errors.append(
+                f"deferral {d!r} is claimed by more than one brief's "
+                f"deferrals: {', '.join(owners)} — a destination must "
+                f"resolve to exactly one brief")
 
 
 def render_map(briefs: dict[str, dict]) -> str:

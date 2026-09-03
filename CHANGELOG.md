@@ -4,6 +4,28 @@ The version is a human judgment, bumped deliberately inside the change that
 will be published — it is never derived mechanically from commit types — and
 `--version` must discriminate any two published trees. Newest first.
 
+## 0.3.0
+
+**A brief can declare it is a deferral's destination.** New field
+`deferrals` — a list of ids, default `[]` — names any prior decision this
+brief is the live record for. `park validate` refuses the same id claimed
+by two briefs' `deferrals`, the same way it already refuses a gate that
+resolves to nothing: a destination is a structural fact now, not a
+sentence a scanner has to relocate every time the prose around it moves.
+
+This closes the gap a checkbox-scanning guard used to paper over: locating
+"where did that deferred item go" by regex over a declaration line broke
+on a reflow that changed no meaning, and — the more dangerous direction —
+could resolve to whichever text happened to sit next to a mention of the
+id, rather than to its actual owner. `deferrals` makes the destination a
+field a validator can check, not a location a reader has to infer.
+
+**Not a breaking change for existing trees.** `deferrals` is optional and
+reads as `[]` when absent, so a brief written against 0.2.x validates
+unchanged. Declare it only where it carries ids — the briefs that are a
+prior decision's live destination; `park validate` then refuses the same
+id claimed twice.
+
 ## 0.2.0
 
 **The map is active-only.** `park map` renders open, watch and parked

@@ -36,6 +36,8 @@ status: parked                 # open | parked | done | superseded
 owner: agent                   # agent | user — whose move is it?
 gate: [new-export-pipeline]    # blockers, as brief ids
 triggers: []                   # prose events, for armed watches
+deferrals: []                  # ids of prior decisions this brief is the
+                                # live destination for (at most one owner)
 brief: Retire the legacy exporter once the new pipeline carries production.
 ---
 
@@ -64,6 +66,14 @@ work is unblocked and nobody noticed. Prose blockers cannot be checked, and
 they rot quietly: they name mechanisms that were later deleted, or conditions
 that quietly came true months ago. That failure mode is the reason this format
 exists.
+
+The same reasoning covers the other direction — not "what blocks this" but
+"where did that go." `deferrals` is a list of ids too, so `park validate`
+refuses two briefs claiming the same one: a destination that could resolve
+to either is not a destination. Deciding "where did X go" by scanning prose
+for X's name has the opposite failure mode from a stale gate — it can
+resolve to whatever text happens to sit near a *mention* of X, silently,
+which is worse than not resolving at all.
 
 ## Install
 
