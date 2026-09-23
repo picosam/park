@@ -1,13 +1,26 @@
-#!/usr/bin/env python3
-"""park — validate the briefs tree and compile the TODO.md index.
+#!/usr/bin/env python3.15
+"""park — validate the briefs tree, compile the TODO.md index, take intake.
 
     bin/park validate            validate every brief under briefs/
     bin/park map                 validate, then regenerate TODO.md's
                                  generated region in place
     bin/park map --check         validate and compare; non-zero when the
                                  region on disk disagrees with the briefs
+    bin/park intake list         every deposit in briefs/inbox/
+    bin/park intake deposit ID   create briefs/inbox/ID.md from stdin
+                                 (or --file); create-only
+    bin/park intake promote ID   deposit -> briefs/ID.md, map regenerated,
+                                 deposit removed: all of it, or nothing
+    bin/park intake reject ID --reason TEXT
+                                 delete the deposit, print one record line
+    bin/park intake github       open issues -> deposits (reads the forge)
+    bin/park intake github --outbound [--apply]
+                                 plan (or, with --apply, make) the closes
+                                 of issues whose brief is done
 
-Exit 0 clean; 1 on a validation failure or drift; 2 on usage.
+Exit 0 clean; 1 on a refusal (validation, drift, intake); 2 on usage. Every
+refusal line opens with a stable code, `PARK-Ennn` — CODES below, and the
+README's table, which a test holds to it.
 
 The repository root is the nearest directory at or above the working
 directory that carries `briefs/` — resolved from where park is RUN, never
@@ -48,6 +61,12 @@ Once nothing is left below the marker, the whole file is generated.
 """
 
 import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -60,7 +79,7 @@ from pathlib import Path
 # deliberately inside the change that will be published — never derived
 # mechanically from commit types — and --version must discriminate any two
 # published trees.
-PARK_VERSION = "0.3.0"
+PARK_VERSION = "0.4.0"
 
 def find_root() -> Path:
     """The nearest ancestor (working directory upward) carrying `briefs/`.
@@ -93,6 +112,77 @@ LIST_FIELDS = {"gate", "triggers", "deferrals"}
 # deferral destination", which is exactly what `[]` says.
 OPTIONAL_DEFAULTS = {"deferrals": ()}
 END_MARK = "<!-- END GENERATED park map -->"
+INBOX = BRIEFS / "inbox"
+
+# Stable refusal codes (0.4.0). Every refusal line opens with one, so tests,
+# documentation and an adopter's allowlist can name the refusal rather than
+# its prose, and a message can be reworded without breaking any of them. A
+# code is never reused for a different refusal. `public-park/README.md`
+# carries the same table, held to this one by a test.
+CODES = {
+    "PARK-E001": "usage: an unknown verb, flag or combination",
+    "PARK-E101": "`briefs/` does not exist at or above the working directory",
+    "PARK-E102": "a brief cannot be read as UTF-8 text",
+    "PARK-E103": "a brief has no frontmatter (its first line is not `---`)",
+    "PARK-E104": "a brief's frontmatter is never closed with `---`",
+    "PARK-E105": "a frontmatter line is not `key: value`",
+    "PARK-E106": "an unknown frontmatter field",
+    "PARK-E107": "a duplicate frontmatter field",
+    "PARK-E108": "a list item outside a list field",
+    "PARK-E109": "an empty list item",
+    "PARK-E110": "a list field that is not a list",
+    "PARK-E111": "a required field is missing",
+    "PARK-E112": "the id does not match the filename stem",
+    "PARK-E113": "a duplicate id",
+    "PARK-E114": "`briefs/` cannot be listed",
+    "PARK-E120": "`type` outside its vocabulary",
+    "PARK-E121": "`status` outside its vocabulary",
+    "PARK-E122": "`owner` outside its vocabulary",
+    "PARK-E123": "the `brief` line is empty",
+    "PARK-E124": "a watch whose status is not open",
+    "PARK-E125": "a watch without a trigger",
+    "PARK-E130": "a `manual:` gate carrying no checkable fact",
+    "PARK-E131": "a gate that references its own brief",
+    "PARK-E132": "a gate that resolves to no brief",
+    "PARK-E133": "parked, but every gate has closed: the gate has opened",
+    "PARK-E134": "one deferral id claimed by more than one brief",
+    "PARK-E140": "`TODO.md` carries no generated region (`map --check`)",
+    "PARK-E141": "`TODO.md` is stale against the briefs (`map --check`)",
+    "PARK-E142": "`TODO.md` cannot be read as UTF-8 text",
+    "PARK-E201": "a deposit id that is not a lowercase kebab slug",
+    "PARK-E202": "no such deposit in `briefs/inbox/` (the queue's README, "
+                 "in any spelling, is none)",
+    "PARK-E203": "the deposit already exists (deposits are create-only)",
+    "PARK-E204": "a brief with that id already exists",
+    "PARK-E205": "a deposit that is empty or not UTF-8 text",
+    "PARK-E206": "line 1 is not a provenance line",
+    "PARK-E207": "an origin outside the closed vocabulary",
+    "PARK-E208": "the provenance line declares no origin",
+    "PARK-E209": "`--origin` given for a line that already declares one",
+    "PARK-E210": "line 2, the map line, is missing or blank",
+    "PARK-E211": "a scaffolded value is blank, multi-line, padded, or does "
+                 "not read back as itself",
+    "PARK-E212": "a rejection reason that is blank or not one line",
+    "PARK-E213": "that `github#N` origin is already deposited or promoted",
+    "PARK-E214": "a write failed; every file was restored",
+    "PARK-E215": "promotion refused: the tree would not validate",
+    "PARK-E216": "a deposit id reserved for the queue's README, in any "
+                 "letter case",
+    "PARK-E217": "an intake input cannot be read: the `--file` or stdin "
+                 "text, a deposit, or the `briefs/inbox/` listing",
+    "PARK-E301": "`gh` is not on PATH",
+    "PARK-E302": "`gh` failed or timed out",
+    "PARK-E303": "`gh` answered something other than the expected JSON",
+    "PARK-E304": "a deposit file for an issue exists without its origin",
+    "PARK-E305": "an outbound close failed; the ones before it were made",
+}
+
+
+def refusal(code: str, text: str) -> str:
+    """One refusal line: its stable code, then the prose."""
+    if code not in CODES:
+        raise KeyError(f"undeclared refusal code {code}")
+    return f"{code} {text}"
 
 
 def _unquote(value: str) -> str:
@@ -103,19 +193,26 @@ def _unquote(value: str) -> str:
 
 
 def parse_front(path: Path, errors: list[str]) -> dict | None:
+    """Parse one brief file's frontmatter, or None on failure."""
+    rel = path.relative_to(ROOT)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        errors.append(refusal("PARK-E102", f"{rel}: unreadable ({exc})"))
+        return None
+    return parse_text(rel, text, errors)
+
+
+def parse_text(rel, text: str, errors: list[str]) -> dict | None:
     """Parse one brief's frontmatter into a dict, or None on failure.
 
     Accepts the ratified subset only: `key: scalar`, `key: [a, b]`, and
     `key:` followed by `  - item` lines, between two `---` fences.
     """
-    rel = path.relative_to(ROOT)
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError) as exc:
-        errors.append(f"{rel}: unreadable ({exc})")
-        return None
+    lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
-        errors.append(f"{rel}: no frontmatter — first line must be ---")
+        errors.append(refusal("PARK-E103", f"{rel}: no frontmatter — first "
+                                           f"line must be ---"))
         return None
     data: dict = {}
     pending_list: str | None = None
@@ -129,11 +226,13 @@ def parse_front(path: Path, errors: list[str]) -> dict | None:
             break
         if line.startswith("  - ") or line.startswith("- "):
             if pending_list is None:
-                errors.append(f"{rel}:{n}: list item outside a list field")
+                errors.append(refusal("PARK-E108", f"{rel}:{n}: list item "
+                                                   f"outside a list field"))
                 return None
             item = _unquote(line.split("- ", 1)[1].strip())
             if not item:
-                errors.append(f"{rel}:{n}: empty list item")
+                errors.append(refusal("PARK-E109",
+                                      f"{rel}:{n}: empty list item"))
                 return None
             data[pending_list].append(item)
             continue
@@ -143,14 +242,17 @@ def parse_front(path: Path, errors: list[str]) -> dict | None:
         key, sep, value = line.partition(":")
         key = key.strip()
         if not sep or key != key.lstrip():
-            errors.append(f"{rel}:{n}: not a `key: value` line: {line!r}")
+            errors.append(refusal("PARK-E105", f"{rel}:{n}: not a "
+                                               f"`key: value` line: {line!r}"))
             return None
         if key not in FIELDS:
-            errors.append(f"{rel}:{n}: unknown field {key!r} "
-                          f"(schema fields: {', '.join(FIELDS)})")
+            errors.append(refusal("PARK-E106", f"{rel}:{n}: unknown field "
+                                  f"{key!r} (schema fields: "
+                                  f"{', '.join(FIELDS)})"))
             return None
         if key in data:
-            errors.append(f"{rel}:{n}: duplicate field {key!r}")
+            errors.append(refusal("PARK-E107",
+                                  f"{rel}:{n}: duplicate field {key!r}"))
             return None
         value = value.strip()
         if key in LIST_FIELDS:
@@ -165,30 +267,57 @@ def parse_front(path: Path, errors: list[str]) -> dict | None:
                              else [_unquote(v.strip())
                                    for v in inner.split(",")])
             else:
-                errors.append(f"{rel}:{n}: {key} must be a list "
-                              f"([] / [a, b] / block form), got {value!r}")
+                errors.append(refusal("PARK-E110", f"{rel}:{n}: {key} must "
+                                      f"be a list ([] / [a, b] / block "
+                                      f"form), got {value!r}"))
                 return None
         else:
             data[key] = _unquote(value)
     if not closed:
-        errors.append(f"{rel}: frontmatter never closed with ---")
+        errors.append(refusal("PARK-E104", f"{rel}: frontmatter never "
+                                           f"closed with ---"))
         return None
+    missing = False
     for field in FIELDS:
         if field not in data:
             if field in OPTIONAL_DEFAULTS:
                 data[field] = list(OPTIONAL_DEFAULTS[field])
                 continue
-            errors.append(f"{rel}: missing required field {field!r}")
-    if any(e.startswith(f"{rel}: missing") for e in errors):
-        return None
-    return data
+            errors.append(refusal("PARK-E111", f"{rel}: missing required "
+                                               f"field {field!r}"))
+            missing = True
+    return None if missing else data
+
+
+def unlistable(directory: Path) -> str | None:
+    """Why `directory` cannot be listed, or None when it can.
+
+    `Path.glob` answers `[]` for a directory it may not read, which is
+    indistinguishable from an empty one: an unlistable `briefs/` would
+    validate as zero briefs and map to an empty index. Every listing park
+    acts on asks this first.
+    """
+    try:
+        with os.scandir(directory):
+            return None
+    except OSError as exc:
+        return exc.strerror or type(exc).__name__
 
 
 def load_briefs(errors: list[str]) -> dict[str, dict]:
     if not BRIEFS.is_dir():
-        errors.append(f"{BRIEFS.relative_to(ROOT)}/: directory does not exist")
+        errors.append(refusal("PARK-E101", f"{BRIEFS.relative_to(ROOT)}/: "
+                                           f"directory does not exist"))
+        return {}
+    why = unlistable(BRIEFS)
+    if why is not None:
+        errors.append(refusal("PARK-E114", f"{BRIEFS.relative_to(ROOT)}/: "
+                                           f"cannot be listed ({why})"))
         return {}
     briefs: dict[str, dict] = {}
+    # NOT recursive, by design: `briefs/inbox/` holds deposits, which are
+    # proposals and must never enter the index. A recursive glob would index
+    # every deposit the day it landed.
     for path in sorted(BRIEFS.glob("*.md")):
         rel = path.relative_to(ROOT)
         data = parse_front(path, errors)
@@ -196,11 +325,13 @@ def load_briefs(errors: list[str]) -> dict[str, dict]:
             continue
         bid = data["id"]
         if bid != path.stem:
-            errors.append(f"{rel}: id {bid!r} does not match filename "
-                          f"stem {path.stem!r} (one brief, one file, one id)")
+            errors.append(refusal("PARK-E112", f"{rel}: id {bid!r} does not "
+                                  f"match filename stem {path.stem!r} (one "
+                                  f"brief, one file, one id)"))
             continue
         if bid in briefs:
-            errors.append(f"{rel}: duplicate id {bid!r}")
+            errors.append(refusal("PARK-E113",
+                                  f"{rel}: duplicate id {bid!r}"))
             continue
         data["_path"] = rel
         briefs[bid] = data
@@ -211,37 +342,42 @@ def validate(briefs: dict[str, dict], errors: list[str]) -> None:
     for bid, b in sorted(briefs.items()):
         rel = b["_path"]
         if b["type"] not in TYPES:
-            errors.append(f"{rel}: type {b['type']!r} not in "
-                          f"{sorted(TYPES)}")
+            errors.append(refusal("PARK-E120", f"{rel}: type {b['type']!r} "
+                                               f"not in {sorted(TYPES)}"))
         if b["status"] not in STATUSES:
-            errors.append(f"{rel}: status {b['status']!r} not in "
-                          f"{sorted(STATUSES)}")
+            errors.append(refusal("PARK-E121", f"{rel}: status "
+                                  f"{b['status']!r} not in {sorted(STATUSES)}"))
         if b["owner"] not in OWNERS:
-            errors.append(f"{rel}: owner {b['owner']!r} not in "
-                          f"{sorted(OWNERS)}")
+            errors.append(refusal("PARK-E122", f"{rel}: owner "
+                                  f"{b['owner']!r} not in {sorted(OWNERS)}"))
         if not b["brief"]:
-            errors.append(f"{rel}: brief is empty — it is the map line")
+            errors.append(refusal("PARK-E123", f"{rel}: brief is empty — it "
+                                               f"is the map line"))
         if b["type"] == "watch":
             # The decided looseness: a watch is armed, not worked — it
             # carries status: open plus at least one trigger.
             if b["status"] != "open":
-                errors.append(f"{rel}: a watch carries status: open "
-                              f"(got {b['status']!r})")
+                errors.append(refusal("PARK-E124", f"{rel}: a watch carries "
+                                      f"status: open (got {b['status']!r})"))
             if not b["triggers"]:
-                errors.append(f"{rel}: a watch needs at least one trigger")
+                errors.append(refusal("PARK-E125", f"{rel}: a watch needs at "
+                                                   f"least one trigger"))
         resolved = []
         for g in b["gate"]:
             if g.startswith("manual:"):
                 if not g[len("manual:"):].strip():
-                    errors.append(f"{rel}: gate 'manual:' carries no "
-                                  f"checkable fact")
+                    errors.append(refusal("PARK-E130", f"{rel}: gate "
+                                          f"'manual:' carries no checkable "
+                                          f"fact"))
                 resolved.append(None)  # unresolvable by design
                 continue
             if g == bid:
-                errors.append(f"{rel}: gate references the brief itself")
+                errors.append(refusal("PARK-E131", f"{rel}: gate references "
+                                                   f"the brief itself"))
                 continue
             if g not in briefs:
-                errors.append(f"{rel}: gate {g!r} resolves to no brief")
+                errors.append(refusal("PARK-E132", f"{rel}: gate {g!r} "
+                                                   f"resolves to no brief"))
                 continue
             resolved.append(briefs[g]["status"])
         # §3 refinement 1: the gate-opened pathology, mechanically.
@@ -251,9 +387,10 @@ def validate(briefs: dict[str, dict], errors: list[str]) -> None:
                 and len(resolved) == len(b["gate"])):
             closed_gates = ", ".join(
                 f"{g}: {briefs[g]['status']}" for g in b["gate"])
-            errors.append(f"{rel}: status parked but every gate is closed "
-                          f"({closed_gates}) — the gate has opened; "
-                          f"work it or re-park it on a real gate")
+            errors.append(refusal("PARK-E133", f"{rel}: status parked but "
+                                  f"every gate is closed ({closed_gates}) — "
+                                  f"the gate has opened; work it or re-park "
+                                  f"it on a real gate"))
 
     # §3 refinement 2: a deferral destination must be unresolvable in only
     # one direction. Two briefs both claiming the same id is not a lost
@@ -267,10 +404,11 @@ def validate(briefs: dict[str, dict], errors: list[str]) -> None:
             claimed_by.setdefault(d, []).append(bid)
     for d, owners in sorted(claimed_by.items()):
         if len(owners) > 1:
-            errors.append(
+            errors.append(refusal(
+                "PARK-E134",
                 f"deferral {d!r} is claimed by more than one brief's "
                 f"deferrals: {', '.join(owners)} — a destination must "
-                f"resolve to exactly one brief")
+                f"resolve to exactly one brief"))
 
 
 def render_map(briefs: dict[str, dict]) -> str:
@@ -343,8 +481,679 @@ def split_todo(text: str) -> tuple[str | None, str]:
     return head + END_MARK + "\n", tail.lstrip("\n")
 
 
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="park")
+def compose_map(briefs: dict[str, dict]) -> tuple[str, str, str | None]:
+    """(TODO.md as it is, what `map` would write, its generated head)."""
+    rendered = render_map(briefs)
+    try:
+        current = TODO.read_text(encoding="utf-8") if TODO.is_file() else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise Refused(refusal("PARK-E142", f"{TODO.name}: unreadable "
+                                           f"({exc})")) from None
+    head, tail = split_todo(current)
+    return current, rendered + ("\n" + tail if tail else ""), head
+
+
+# ------------------------------------------------------------------ intake
+#
+# `briefs/inbox/` is the deposit queue: proposals from whoever cannot or
+# should not write a brief directly — an analyst with no commit rights, an
+# issue tracker, a script, a review's residue. A deposit is one file:
+#
+#     line 1  Deposited by <who>, <YYYY-MM-DD>, origin <origin>
+#     line 2  the one-line map entry the promoted brief would carry
+#     rest    the finding
+#
+# `<origin>` is a closed vocabulary — ORIGINS, or `github#<N>` for an issue —
+# carried on that line and in no frontmatter field. A line 1 with no
+# `, origin ...` is the form written before 0.4.0: `promote` takes it with
+# an explicit `--origin`, and `deposit` refuses it. Deposits never enter the
+# index: the loader globs `briefs/*.md` and nothing deeper.
+
+ORIGINS = ("analyst", "operator", "script", "review")
+GITHUB_ORIGIN = re.compile(r"github#([1-9][0-9]*)")
+SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+PROVENANCE = re.compile(
+    r"Deposited by (?P<by>[A-Za-z0-9][A-Za-z0-9._-]*), "
+    r"(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})"
+    r"(?:, origin (?P<origin>[a-z]+(?:#[0-9]+)?))?")
+QUEUE_README = "README.md"
+
+
+class Refused(Exception):
+    """An intake refusal: one or more coded lines."""
+
+    def __init__(self, *lines: str):
+        super().__init__(lines[0])
+        self.lines = lines
+
+
+def origin_valid(origin: str) -> bool:
+    return origin in ORIGINS or GITHUB_ORIGIN.fullmatch(origin) is not None
+
+
+def origin_words() -> str:
+    return f"{', '.join(ORIGINS)}, github#<N>"
+
+
+def github_number(origin: str | None) -> int | None:
+    m = GITHUB_ORIGIN.fullmatch(origin or "")
+    return int(m.group(1)) if m else None
+
+
+def parse_provenance(line: str, where: str) -> re.Match:
+    """Line 1, strictly: the whole line, a real calendar date, and an origin
+    from the vocabulary when one is declared."""
+    m = PROVENANCE.fullmatch(line.strip())
+    if m is None:
+        raise Refused(refusal("PARK-E206", f"{where}: line 1 must read "
+                              f"`Deposited by <who>, <YYYY-MM-DD>, origin "
+                              f"<origin>`; it reads {line!r}"))
+    try:
+        datetime.date.fromisoformat(m["date"])
+    except ValueError:
+        raise Refused(refusal("PARK-E206", f"{where}: line 1 carries no real "
+                              f"date ({m['date']!r})")) from None
+    if m["origin"] is not None and not origin_valid(m["origin"]):
+        raise Refused(refusal("PARK-E207", f"{where}: origin "
+                              f"{m['origin']!r} is not one of "
+                              f"{origin_words()}"))
+    return m
+
+
+def leading_origin(line: str) -> str | None:
+    """The origin a provenance line OPENS with, leniently: a brief's body may
+    continue that line with prose (`...; promoted by ...`). Answers only
+    "is this `github#N` recorded already?"."""
+    m = PROVENANCE.match(line.strip())
+    if m is None or m["origin"] is None:
+        return None
+    after = line.strip()[m.end():][:1]
+    return None if after and (after.isalnum() or after in "#_") \
+        else m["origin"]
+
+
+def one_line(value: str) -> bool:
+    return bool(value) and value.splitlines() == [value]
+
+
+def deposit_path(did: str) -> Path:
+    return INBOX / f"{did}.md"
+
+
+def need_slug(did: str) -> None:
+    if not SLUG.fullmatch(did):
+        raise Refused(refusal("PARK-E201", f"{did!r} is not a lowercase "
+                              f"kebab slug ([a-z0-9] words joined by -)"))
+
+
+def is_queue_readme(path: Path) -> bool:
+    """Whether `path`, a name in the inbox, is the queue's own README.
+
+    Two rules, because each sees what the other cannot. By NAME: any name
+    whose casefold is `readme.md` is reserved on every filesystem, so a
+    case-sensitive one refuses exactly the spellings a case-insensitive one
+    resolves to the README, and no id can create a file that becomes the
+    README when the tree is opened on the other kind. By IDENTITY: whatever
+    names the same file as `briefs/inbox/README.md` when that exists, as a
+    directory entry or through a link. That is the filesystem's own answer,
+    covering any folding or normalisation beyond Python's casefold. On
+    case-insensitive APFS, measured 2026-09-23, the two agree on every
+    name (no other code point stands for a letter of `readme`, and none
+    inserted into it is ignored), so there identity adds only the links.
+    """
+    if path.name.casefold() == QUEUE_README.casefold():
+        return True
+    readme = INBOX / QUEUE_README
+    for probe in (os.lstat, os.stat):
+        try:
+            if os.path.samestat(probe(path), probe(readme)):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def deposits() -> list[Path]:
+    """Every deposit: `*.md` directly under the inbox, its README aside."""
+    if not INBOX.is_dir():
+        return []
+    why = unlistable(INBOX)
+    if why is not None:
+        raise Refused(refusal("PARK-E217", f"{INBOX.relative_to(ROOT)}/: "
+                                           f"cannot be listed ({why})"))
+    return sorted(p for p in INBOX.glob("*.md")
+                  if not is_queue_readme(p) and p.is_file())
+
+
+def read_deposit(path: Path) -> list[str]:
+    rel = path.relative_to(ROOT)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise Refused(refusal("PARK-E205", f"{rel}: not UTF-8 text")) \
+            from None
+    except OSError as exc:
+        raise Refused(refusal("PARK-E217", f"{rel}: unreadable "
+                              f"({exc.strerror or type(exc).__name__})")) \
+            from None
+    lines = text.splitlines()
+    if not lines or not lines[0].strip():
+        raise Refused(refusal("PARK-E205", f"{rel}: empty, or line 1 is "
+                                           f"blank"))
+    return lines
+
+
+def map_line(lines: list[str], where: str) -> str:
+    line = lines[1].strip() if len(lines) > 1 else ""
+    if not line:
+        raise Refused(refusal("PARK-E210", f"{where}: line 2 must be the "
+                              f"one-line map entry; it is missing or blank"))
+    return line
+
+
+def recorded_github() -> dict[int, str]:
+    """`github#N` -> where it is already recorded: a deposit's line 1, or
+    the first body line of a brief. Briefs are read leniently here (any file
+    whose frontmatter closes): this answers "seen before?", it validates
+    nothing.
+
+    Fail-closed on what it cannot SEE, lenient on what it cannot DECODE. A
+    file or directory it cannot read might record the very issue asked
+    about, so that refuses (E217 for the queue, E114/E102 for the briefs)
+    instead of being skipped into a duplicate. Bytes that are not UTF-8 are
+    decoded with replacement: the provenance line is ASCII, so no decoding
+    choice can hide or forge one, and junk elsewhere in a file no longer
+    hides the line it opens with."""
+    seen: dict[int, str] = {}
+    for path in deposits():
+        rel = path.relative_to(ROOT)
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise Refused(refusal("PARK-E217", f"{rel}: unreadable, so it "
+                                  f"cannot be checked for a github origin "
+                                  f"({exc.strerror or type(exc).__name__})")) \
+                from None
+        first = raw.decode("utf-8", "replace").splitlines()[:1]
+        n = github_number(leading_origin(first[0]) if first else None)
+        if n is not None:
+            seen.setdefault(n, str(rel))
+    if not BRIEFS.is_dir():
+        return seen
+    why = unlistable(BRIEFS)
+    if why is not None:
+        raise Refused(refusal("PARK-E114", f"{BRIEFS.relative_to(ROOT)}/: "
+                                           f"cannot be listed ({why})"))
+    for path in sorted(BRIEFS.glob("*.md")):
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise Refused(refusal("PARK-E102", f"{path.relative_to(ROOT)}: "
+                                  f"unreadable, so it cannot be checked for "
+                                  f"a github origin "
+                                  f"({exc.strerror or type(exc).__name__})")) \
+                from None
+        lines = raw.decode("utf-8", "replace").splitlines()
+        fences = [i for i, l in enumerate(lines) if l.strip() == "---"]
+        if len(fences) < 2 or fences[0] != 0:
+            continue
+        body = [l for l in lines[fences[1] + 1:] if l.strip()]
+        n = github_number(leading_origin(body[0]) if body else None)
+        if n is not None:
+            seen.setdefault(n, str(path.relative_to(ROOT)))
+    return seen
+
+
+def scaffold(bid: str, btype: str, triggers: list[str], line: str,
+             body: str) -> str:
+    trig = ("triggers: []" if not triggers else
+            "triggers:\n" + "\n".join(f"  - {t}" for t in triggers))
+    return (f"---\nid: {bid}\ntype: {btype}\nstatus: open\nowner: user\n"
+            f"gate: []\n{trig}\ndeferrals: []\nbrief: {line}\n---\n\n"
+            f"{body}")
+
+
+def survives(bid: str, btype: str, triggers: list[str], line: str) -> None:
+    """Every value written into frontmatter must read back as itself."""
+    for value in (line, *triggers):
+        if not one_line(value) or value != value.strip():
+            raise Refused(refusal("PARK-E211", f"{value!r} is blank, "
+                                  f"multi-line or padded"))
+    errors: list[str] = []
+    data = parse_text(f"briefs/{bid}.md",
+                      scaffold(bid, btype, triggers, line, "x\n"), errors)
+    want = {"id": bid, "type": btype, "status": "open", "owner": "user",
+            "gate": [], "triggers": list(triggers), "deferrals": [],
+            "brief": line}
+    got = {k: data[k] for k in want} if data else None
+    if got != want:
+        raise Refused(refusal("PARK-E211", f"a value does not read back as "
+                              f"itself through the frontmatter subset "
+                              f"(wrote {want}, reads back {got})"))
+
+
+def create_file(path: Path, text: str, made: list[Path]) -> None:
+    """Create-only: never overwrites. Records the file for a rollback."""
+    with open(path, "x", encoding="utf-8") as handle:
+        made.append(path)
+        handle.write(text)
+
+
+def rollback(made: list[Path], restore: dict) -> None:
+    """Undo, newest first: remove what was created, put back the bytes of
+    what was changed or removed (None: it did not exist before)."""
+    for path in reversed(made):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    for path, data in restore.items():
+        try:
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(data)
+        except OSError:
+            pass
+
+
+def intake_list(args) -> int:
+    where = f"{INBOX.relative_to(ROOT)}/"
+    if not INBOX.is_dir():
+        print(f"park: 0 deposit(s) ({where} does not exist)")
+        return 0
+    found = deposits()
+    print(f"park: {len(found)} deposit(s) in {where}")
+    for path in found:
+        rel = str(path.relative_to(ROOT))
+        try:
+            lines = read_deposit(path)
+            m = parse_provenance(lines[0], rel)
+            line = map_line(lines, rel)
+            origin = m["origin"] or "none (promote needs --origin)"
+            print(f"  {path.stem}  origin {origin}  {m['date']}  by "
+                  f"{m['by']} — {line}")
+        except Refused as exc:
+            print(f"  {path.stem}  NOT PROMOTABLE: {exc.lines[0]}")
+    return 0
+
+
+def reserved(did: str, code: str) -> None:
+    """Refuse an id naming the queue's README, before anything else about
+    it is judged, so every spelling of that name gets the same code from a
+    verb whatever else is wrong with it and whichever filesystem it is on."""
+    if is_queue_readme(deposit_path(did)):
+        raise Refused(refusal(code, f"{did!r} names the queue's own "
+                              f"{INBOX.relative_to(ROOT)}/{QUEUE_README}, "
+                              f"which is not a deposit in any letter case"))
+
+
+def deposit_input(args) -> bytes:
+    """The deposit's text, from `--file` or stdin: read failures refused."""
+    where = f"--file {args.file}" if args.file is not None else "stdin"
+    try:
+        if args.file is not None:
+            return Path(args.file).read_bytes()
+        if sys.stdin is None:
+            raise OSError(0, "no standard input")
+        return sys.stdin.buffer.read()
+    except OSError as exc:
+        raise Refused(refusal("PARK-E217", f"{where}: unreadable "
+                              f"({exc.strerror or type(exc).__name__})")) \
+            from None
+
+
+def intake_deposit(args) -> int:
+    reserved(args.id, "PARK-E216")
+    need_slug(args.id)
+    path = deposit_path(args.id)
+    rel = f"{INBOX.relative_to(ROOT)}/{args.id}.md"
+    if path.exists():
+        raise Refused(refusal("PARK-E203", f"{rel} exists; a deposit is "
+                                           f"never overwritten"))
+    if (BRIEFS / f"{args.id}.md").exists():
+        raise Refused(refusal("PARK-E204", f"briefs/{args.id}.md exists; "
+                                           f"choose another id"))
+    raw = deposit_input(args)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused(refusal("PARK-E205", "the deposit text is not UTF-8")) \
+            from None
+    lines = text.splitlines()
+    if not lines or not lines[0].strip():
+        raise Refused(refusal("PARK-E205", "the deposit text is empty, or "
+                                           "its line 1 is blank"))
+    m = parse_provenance(lines[0], "deposit")
+    if m["origin"] is None:
+        raise Refused(refusal("PARK-E208", f"deposit: line 1 declares no "
+                              f"origin; end it with `, origin <origin>` "
+                              f"({origin_words()})"))
+    survives(args.id, "task", [], map_line(lines, "deposit"))
+    n = github_number(m["origin"])
+    # Only a github origin can be a duplicate; scanning for any other would
+    # let an unreadable, unrelated file refuse an analyst's deposit.
+    seen = recorded_github() if n is not None else {}
+    if n is not None and n in seen:
+        raise Refused(refusal("PARK-E213", f"github#{n} is already recorded "
+                                           f"in {seen[n]}"))
+    made: list[Path] = []
+    new_dir = not INBOX.is_dir()
+    try:
+        INBOX.mkdir(parents=True, exist_ok=True)
+        create_file(path, text if text.endswith("\n") else text + "\n", made)
+    except OSError as exc:
+        rollback(made, {})
+        if new_dir:
+            try:
+                INBOX.rmdir()
+            except OSError:
+                pass
+        code = "PARK-E203" if isinstance(exc, FileExistsError) else "PARK-E214"
+        raise Refused(refusal(code, f"writing {rel} failed ({exc}); nothing "
+                                    f"was left behind")) from None
+    print(f"park: deposited {rel} (origin {m['origin']})")
+    return 0
+
+
+def intake_promote(args) -> int:
+    reserved(args.id, "PARK-E202")
+    need_slug(args.id)
+    path = deposit_path(args.id)
+    rel = f"{INBOX.relative_to(ROOT)}/{args.id}.md"
+    if not path.is_file():
+        raise Refused(refusal("PARK-E202", f"{rel} does not exist"))
+    target = BRIEFS / f"{args.id}.md"
+    if target.exists():
+        raise Refused(refusal("PARK-E204", f"briefs/{args.id}.md exists; a "
+                              f"promotion never overwrites a brief"))
+    lines = read_deposit(path)
+    m = parse_provenance(lines[0], rel)
+    provenance = lines[0].strip()
+    if m["origin"] is None:
+        if args.origin is None:
+            raise Refused(refusal("PARK-E208", f"{rel}: line 1 declares no "
+                                  f"origin; pass --origin <origin> "
+                                  f"({origin_words()})"))
+        if not origin_valid(args.origin):
+            raise Refused(refusal("PARK-E207", f"--origin {args.origin!r} is "
+                                  f"not one of {origin_words()}"))
+        provenance += f", origin {args.origin}"
+    elif args.origin is not None:
+        raise Refused(refusal("PARK-E209", f"{rel}: line 1 already declares "
+                              f"origin {m['origin']}; drop --origin"))
+    line = map_line(lines, rel)
+    triggers = list(args.trigger or [])
+    survives(args.id, args.type, triggers, line)
+    rest = lines[2:]
+    while rest and not rest[0].strip():
+        rest = rest[1:]
+    body = provenance + "\n" + ("\n" + "\n".join(rest) + "\n" if rest else "")
+    text = scaffold(args.id, args.type, triggers, line, body)
+
+    errors: list[str] = []
+    briefs = load_briefs(errors)
+    brief_rel = BRIEFS.relative_to(ROOT) / f"{args.id}.md"
+    data = parse_text(brief_rel, text, errors)
+    if data is not None:
+        data["_path"] = brief_rel
+        briefs[args.id] = data
+    validate(briefs, errors)
+    if errors:
+        raise Refused(*errors, refusal("PARK-E215", f"{len(errors)} error(s) "
+                                       f"with {brief_rel} added; nothing was "
+                                       f"written"))
+    current, want, _ = compose_map(briefs)
+
+    made: list[Path] = []
+    restore: dict = {}
+    try:
+        create_file(target, text, made)
+        if current != want:
+            restore[TODO] = TODO.read_bytes() if TODO.is_file() else None
+            TODO.write_text(want, encoding="utf-8")
+        restore[path] = path.read_bytes()
+        path.unlink()
+    except OSError as exc:
+        rollback(made, restore)
+        raise Refused(refusal("PARK-E214", f"promoting {rel} failed "
+                              f"({exc}); every file was restored")) from None
+    print(f"park: promoted {rel} to {brief_rel} (type {args.type}, owner "
+          f"user); map written ({len(briefs)} briefs); deposit removed")
+    return 0
+
+
+def intake_reject(args) -> int:
+    did = args.id
+    path = deposit_path(did)
+    rel = f"{INBOX.relative_to(ROOT)}/{did}.md"
+    if not did or "/" in did or "\\" in did or did.startswith("."):
+        raise Refused(refusal("PARK-E202", f"{rel} names no deposit"))
+    reserved(did, "PARK-E202")
+    if not path.is_file():
+        raise Refused(refusal("PARK-E202", f"{rel} names no deposit"))
+    reason = args.reason.strip()
+    if not one_line(reason):
+        raise Refused(refusal("PARK-E212", "--reason must be one non-blank "
+                                           "line"))
+    # The read only feeds the record line. A deposit reject cannot read is
+    # still rejected, because clearing what cannot be promoted is this verb's
+    # job and `list` points at it for exactly that; the line says what was
+    # read, and never claims a provenance it could not see.
+    unread = None
+    try:
+        first = path.read_text(encoding="utf-8").splitlines()[:1]
+    except UnicodeDecodeError:
+        first = []
+    except OSError as exc:
+        first, unread = [], exc.strerror or type(exc).__name__
+    m = PROVENANCE.fullmatch(first[0].strip()) if first else None
+    what = (f"deposited by {m['by']}, {m['date']}, origin "
+            f"{m['origin'] or 'none'}" if m
+            else f"unreadable ({unread}), provenance unknown" if unread
+            else "no provenance line")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise Refused(refusal("PARK-E214", f"removing {rel} failed ({exc}); "
+                                           f"it is unchanged")) from None
+    print(f"park: rejected {rel} ({what}): {reason}")
+    return 0
+
+
+# ------------------------------------------------------------------ GitHub
+#
+# Inbound reads the forge and writes only local deposits: `gh issue list`
+# becomes one deposit per open issue not already recorded as `origin
+# github#N` (a deposit's line 1, or a brief body's first line). Outbound
+# prints a plan by default, reading issue state with `gh issue view`; only
+# `--apply` writes to the forge, one `gh issue close --comment` per planned
+# issue. No Project API is used, and nothing here runs on a schedule: every
+# run is someone's command. A rejected issue comes back on the next import
+# unless it is closed or filtered out with `--label`.
+
+GH_TIMEOUT = 120
+
+
+def gh_path() -> str:
+    path = shutil.which("gh")
+    if path is None:
+        raise Refused(refusal("PARK-E301", "`gh`, the GitHub CLI, is not on "
+                              "PATH; install and authenticate it, then "
+                              "re-run"))
+    return path
+
+
+def gh(exe: str, args: list[str], repo: str | None) -> str:
+    argv = [exe, *args] + (["--repo", repo] if repo else [])
+    what = f"gh {' '.join(args[:2])}"
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=GH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise Refused(refusal("PARK-E302", f"`{what}` timed out after "
+                                           f"{GH_TIMEOUT}s")) from None
+    except OSError as exc:
+        raise Refused(refusal("PARK-E302", f"`{what}` could not run "
+                                           f"({exc})")) from None
+    if r.returncode != 0:
+        tail = ((r.stderr or r.stdout).strip().splitlines() or ["?"])[-1]
+        raise Refused(refusal("PARK-E302", f"`{what}` exited "
+                                           f"{r.returncode}: {tail}"))
+    return r.stdout
+
+
+def gh_json(exe: str, args: list[str], repo: str | None, shape):
+    try:
+        data = json.loads(gh(exe, args, repo))
+    except json.JSONDecodeError:
+        data = None
+    if not shape(data):
+        raise Refused(refusal("PARK-E303", f"`gh {' '.join(args[:2])}` did "
+                                           f"not answer the expected JSON"))
+    return data
+
+
+def is_issue(item) -> bool:
+    return (isinstance(item, dict) and type(item.get("number")) is int
+            and item["number"] > 0 and isinstance(item.get("title"), str)
+            and isinstance(item.get("url"), str)
+            and isinstance(item.get("body"), (str, type(None))))
+
+
+def issue_id(number: int, title: str) -> str:
+    slug = "-".join(re.findall(r"[a-z0-9]+", title.lower()))[:40].strip("-")
+    return f"gh-{number}" + (f"-{slug}" if slug else "")
+
+
+def issue_line(number: int, title: str) -> str:
+    """The map line: the title on one line, or, when the title would not
+    read back through the frontmatter subset, the title after a prefix."""
+    line = " ".join(title.split()) or f"issue #{number} (no title)"
+    try:
+        survives("gh", "task", [], line)
+    except Refused:
+        line = f"issue #{number}: {line}"
+    return line
+
+
+def github_inbound(args) -> int:
+    exe = gh_path()
+    fields = ["issue", "list", "--state", "open", "--limit", str(args.limit),
+              "--json", "number,title,body,url"]
+    if args.label:
+        fields += ["--label", args.label]
+    issues = gh_json(exe, fields, args.repo,
+                     lambda d: isinstance(d, list) and all(map(is_issue, d)))
+    seen = recorded_github()
+    today = datetime.date.today().isoformat()
+    plan: list[tuple[Path, str]] = []
+    for item in sorted(issues, key=lambda i: i["number"]):
+        n = item["number"]
+        if n in seen:
+            continue
+        path = deposit_path(issue_id(n, item["title"]))
+        if path.exists():
+            raise Refused(refusal("PARK-E304", f"{path.relative_to(ROOT)} "
+                                  f"exists and does not record github#{n}; "
+                                  f"nothing was written"))
+        body = "\n".join((item["body"] or "").splitlines()).strip()
+        plan.append((path, f"Deposited by park, {today}, origin github#{n}\n"
+                           f"{issue_line(n, item['title'])}\n\n"
+                           f"{item['url']}\n"
+                           + (f"\n{body}\n" if body else "")))
+    made: list[Path] = []
+    new_dir = not INBOX.is_dir()
+    try:
+        INBOX.mkdir(parents=True, exist_ok=True)
+        for path, text in plan:
+            create_file(path, text, made)
+    except OSError as exc:
+        rollback(made, {})
+        if new_dir:
+            try:
+                INBOX.rmdir()
+            except OSError:
+                pass
+        raise Refused(refusal("PARK-E214", f"writing the deposits failed "
+                              f"({exc}); none was left behind")) from None
+    names = ", ".join(p.stem for p, _ in plan) or "none"
+    print(f"park: {len(plan)} new deposit(s) from {len(issues)} open "
+          f"issue(s), {len(issues) - len(plan)} already recorded: {names}")
+    return 0
+
+
+def github_outbound(args) -> int:
+    exe = gh_path()
+    errors: list[str] = []
+    briefs = load_briefs(errors)
+    validate(briefs, errors)
+    if errors:
+        raise Refused(*errors)
+    todo = []
+    for bid, b in sorted(briefs.items()):
+        body = [l for l in b["_body"].splitlines() if l.strip()]
+        n = github_number(leading_origin(body[0]) if body else None)
+        if n is not None and b["status"] == "done":
+            todo.append((n, b))
+    planned, skipped = [], []
+    for n, b in todo:
+        state = gh_json(exe, ["issue", "view", str(n), "--json",
+                              "number,state"], args.repo,
+                        lambda d: isinstance(d, dict)
+                        and isinstance(d.get("state"), str))["state"]
+        comment = (f"Closed by park: brief `{b['id']}` reached status done. "
+                   f"{b['brief']}")
+        (planned if state == "OPEN" else skipped).append(
+            (n, b["id"], comment, state))
+    print(f"park: plan — {len(planned)} issue(s) to close, {len(skipped)} "
+          f"not open")
+    for n, bid, comment, _ in planned:
+        print(f"  close #{n} (brief {bid}) with comment: {comment}")
+    for n, bid, _, state in skipped:
+        print(f"  skip  #{n} (brief {bid}): {state.lower()}")
+    if not args.apply:
+        print("park: plan only; nothing was written. Re-run with --apply to "
+              "make these closes.")
+        return 0
+    closed: list[int] = []
+    for n, _, comment, _ in planned:
+        try:
+            gh(exe, ["issue", "close", str(n), "--reason", "completed",
+                     "--comment", comment], args.repo)
+        except Refused as exc:
+            made = ", ".join(f"#{c}" for c in closed) or "none"
+            raise Refused(refusal("PARK-E305", f"closing #{n} failed "
+                                  f"({exc.lines[0]}); closed before it by "
+                                  f"this run: {made}")) from None
+        closed.append(n)
+        print(f"  closed #{n}")
+    print(f"park: applied — {len(closed)} issue(s) closed")
+    return 0
+
+
+def intake_github(args) -> int:
+    if args.apply and not args.outbound:
+        raise Refused(refusal("PARK-E001", "--apply acts only with "
+                                           "--outbound"))
+    if args.outbound and args.label:
+        raise Refused(refusal("PARK-E001", "--label filters the inbound "
+                                           "import only"))
+    return github_outbound(args) if args.outbound else github_inbound(args)
+
+
+# -------------------------------------------------------------------- CLI
+
+class Parser(argparse.ArgumentParser):
+    """argparse, with its usage refusals carrying their code as well."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, refusal("PARK-E001", f"{self.prog}: {message}") + "\n")
+
+
+def build_parser() -> Parser:
+    parser = Parser(prog="park")
     parser.add_argument("--version", action="version",
                         version=f"park {PARK_VERSION}")
     sub = parser.add_subparsers(dest="verb", required=True)
@@ -352,7 +1161,54 @@ def main(argv=None) -> int:
     p_map = sub.add_parser("map")
     p_map.add_argument("--check", action="store_true",
                        help="compare instead of writing; non-zero on drift")
-    args = parser.parse_args(argv)
+    p_in = sub.add_parser("intake", help="the deposit queue, briefs/inbox/")
+    verbs = p_in.add_subparsers(dest="intake", required=True)
+    verbs.add_parser("list", help="every deposit, and whether it promotes")
+    p_dep = verbs.add_parser("deposit", help="create briefs/inbox/ID.md from "
+                             "stdin or --file; never overwrites")
+    p_dep.add_argument("id")
+    p_dep.add_argument("--file")
+    p_pro = verbs.add_parser("promote", help="deposit -> briefs/ID.md, map "
+                             "regenerated, deposit removed: all or nothing")
+    p_pro.add_argument("id")
+    p_pro.add_argument("--type", choices=sorted(TYPES), default="task")
+    p_pro.add_argument("--trigger", action="append", metavar="TEXT")
+    p_pro.add_argument("--origin", help="only for a line 1 that declares "
+                       "none (the form written before 0.4.0)")
+    p_rej = verbs.add_parser("reject", help="delete a deposit and print one "
+                             "record line")
+    p_rej.add_argument("id")
+    p_rej.add_argument("--reason", required=True)
+    p_gh = verbs.add_parser("github", help="open issues -> deposits; "
+                            "--outbound plans the closes, --apply makes them")
+    p_gh.add_argument("--repo", metavar="REPOSITORY")
+    p_gh.add_argument("--label")
+    p_gh.add_argument("--limit", type=issue_limit, default=100)
+    p_gh.add_argument("--outbound", action="store_true")
+    p_gh.add_argument("--apply", action="store_true")
+    return parser
+
+
+def issue_limit(value: str) -> int:
+    if not (value.isdigit() and 1 <= int(value) <= 1000):
+        raise argparse.ArgumentTypeError("takes a whole number, 1 to 1000")
+    return int(value)
+
+
+INTAKE = {"list": intake_list, "deposit": intake_deposit,
+          "promote": intake_promote, "reject": intake_reject,
+          "github": intake_github}
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.verb == "intake":
+        try:
+            return INTAKE[args.intake](args)
+        except Refused as exc:
+            for line in exc.lines:
+                print(line, file=sys.stderr)
+            return 2 if exc.lines[-1].startswith("PARK-E001") else 1
 
     errors: list[str] = []
     briefs = load_briefs(errors)
@@ -367,19 +1223,21 @@ def main(argv=None) -> int:
         print(f"park: {len(briefs)} briefs valid")
         return 0
 
-    rendered = render_map(briefs)
-    current = TODO.read_text(encoding="utf-8") if TODO.is_file() else ""
-    head, tail = split_todo(current)
-    want = rendered + ("\n" + tail if tail else "")
+    try:
+        current, want, head = compose_map(briefs)
+    except Refused as exc:
+        for line in exc.lines:
+            print(line, file=sys.stderr)
+        return 1
     if args.check:
         if head is None:
-            print(f"park: {TODO.name} carries no generated region "
-                  f"(marker {END_MARK!r} absent) — run `bin/park map`",
-                  file=sys.stderr)
+            print(refusal("PARK-E140", f"{TODO.name} carries no generated "
+                          f"region (marker {END_MARK!r} absent) — run "
+                          f"`bin/park map`"), file=sys.stderr)
             return 1
         if current != want:
-            print(f"park: {TODO.name} is stale against briefs/ — "
-                  f"run `bin/park map`", file=sys.stderr)
+            print(refusal("PARK-E141", f"{TODO.name} is stale against "
+                          f"briefs/ — run `bin/park map`"), file=sys.stderr)
             return 1
         print(f"park: map current ({len(briefs)} briefs)")
         return 0
