@@ -14,13 +14,16 @@
     bin/park intake reject ID --reason TEXT
                                  delete the deposit, print one record line
     bin/park intake github       open issues -> deposits (reads the forge)
-    bin/park intake github --outbound [--apply]
+    bin/park intake github --outbound --repo R [--apply]
                                  plan (or, with --apply, make) the closes
-                                 of issues whose brief is done
+                                 of R's issues whose brief is done
+    bin/park intake github --bind [--repo R] [--apply]
+                                 plan (or make) the binding of the 0.4.0
+                                 `github#N` origins to their repository
 
-Exit 0 clean; 1 on a refusal (validation, drift, intake); 2 on usage. Every
-refusal line opens with a stable code, `PARK-Ennn` — CODES below, and the
-README's table, which a test holds to it.
+Exit 0 clean; 1 on a refusal (validation, drift, intake, a failed write); 2
+on usage. Every refusal line opens with a stable code, `PARK-Ennn` — CODES
+below, and the README's table, which a test holds to it.
 
 The repository root is the nearest directory at or above the working
 directory that carries `briefs/` — resolved from where park is RUN, never
@@ -69,6 +72,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 # Declared from the first commit rather than added at publication: the sibling
 # review tool shipped two releases whose `--version` could not tell them apart,
@@ -79,7 +83,7 @@ from pathlib import Path
 # deliberately inside the change that will be published — never derived
 # mechanically from commit types — and --version must discriminate any two
 # published trees.
-PARK_VERSION = "0.4.0"
+PARK_VERSION = "0.4.1"
 
 def find_root() -> Path:
     """The nearest ancestor (working directory upward) carrying `briefs/`.
@@ -141,6 +145,8 @@ CODES = {
     "PARK-E123": "the `brief` line is empty",
     "PARK-E124": "a watch whose status is not open",
     "PARK-E125": "a watch without a trigger",
+    "PARK-E126": "a provenance line whose `github:` origin is not "
+                 "`github:[HOST/]OWNER/NAME#N`",
     "PARK-E130": "a `manual:` gate carrying no checkable fact",
     "PARK-E131": "a gate that references its own brief",
     "PARK-E132": "a gate that resolves to no brief",
@@ -149,6 +155,7 @@ CODES = {
     "PARK-E140": "`TODO.md` carries no generated region (`map --check`)",
     "PARK-E141": "`TODO.md` is stale against the briefs (`map --check`)",
     "PARK-E142": "`TODO.md` cannot be read as UTF-8 text",
+    "PARK-E143": "`TODO.md` cannot be written (`map`)",
     "PARK-E201": "a deposit id that is not a lowercase kebab slug",
     "PARK-E202": "no such deposit in `briefs/inbox/` (the queue's README, "
                  "in any spelling, is none)",
@@ -163,13 +170,18 @@ CODES = {
     "PARK-E211": "a scaffolded value is blank, multi-line, padded, or does "
                  "not read back as itself",
     "PARK-E212": "a rejection reason that is blank or not one line",
-    "PARK-E213": "that `github#N` origin is already deposited or promoted",
+    "PARK-E213": "that GitHub origin is already deposited or promoted",
     "PARK-E214": "a write failed; every file was restored",
     "PARK-E215": "promotion refused: the tree would not validate",
     "PARK-E216": "a deposit id reserved for the queue's README, in any "
                  "letter case",
     "PARK-E217": "an intake input cannot be read: the `--file` or stdin "
                  "text, a deposit, or the `briefs/inbox/` listing",
+    "PARK-E218": "a `github#N` origin, the 0.4.0 form, names no "
+                 "repository: bind it first (`intake github --bind`)",
+    "PARK-E219": "`--bind` cannot prove a `github#N` origin's repository: "
+                 "no issue URL and no `--repo`, a URL naming another "
+                 "number, or two origins binding to one issue",
     "PARK-E301": "`gh` is not on PATH",
     "PARK-E302": "`gh` failed or timed out",
     "PARK-E303": "`gh` answered something other than the expected JSON",
@@ -362,6 +374,14 @@ def validate(briefs: dict[str, dict], errors: list[str]) -> None:
             if not b["triggers"]:
                 errors.append(refusal("PARK-E125", f"{rel}: a watch needs at "
                                                    f"least one trigger"))
+        # A `github:` origin is what outbound closes by and inbound
+        # deduplicates on; one that does not parse would silently do
+        # neither, so it is refused here rather than ignored there.
+        opening = [l for l in b["_body"].splitlines() if l.strip()][:1]
+        bad = malformed_github(opening[0]) if opening else None
+        if bad is not None:
+            errors.append(refusal("PARK-E126", f"{rel}: origin {bad!r} is not "
+                                  f"github:[HOST/]OWNER/NAME#N"))
         resolved = []
         for g in b["gate"]:
             if g.startswith("manual:"):
@@ -503,20 +523,41 @@ def compose_map(briefs: dict[str, dict]) -> tuple[str, str, str | None]:
 #     line 2  the one-line map entry the promoted brief would carry
 #     rest    the finding
 #
-# `<origin>` is a closed vocabulary — ORIGINS, or `github#<N>` for an issue —
-# carried on that line and in no frontmatter field. A line 1 with no
-# `, origin ...` is the form written before 0.4.0: `promote` takes it with
-# an explicit `--origin`, and `deposit` refuses it. Deposits never enter the
+# `<origin>` is a closed vocabulary — ORIGINS, or `github:<repo>#<N>` for
+# issue N of one repository — carried on that line and in no frontmatter
+# field. `<repo>` is `OWNER/NAME` on github.com and `HOST/OWNER/NAME` on any
+# other host; a host always carries a dot and an owner never does, so the
+# two cannot be read as each other. The repository is part of the origin
+# because an issue number alone names nothing: `github#<N>`, the form 0.4.0
+# wrote, let a brief imported from one repository close the same number in
+# another. That form is still read, so it can be found and bound
+# (`intake github --bind`), and refused (PARK-E218) wherever park would
+# write it, deduplicate on it or close by it. A line 1 with no `, origin
+# ...` is the form written before 0.4.0: `promote` takes it with an
+# explicit `--origin`, and `deposit` refuses it. Deposits never enter the
 # index: the loader globs `briefs/*.md` and nothing deeper.
 
 ORIGINS = ("analyst", "operator", "script", "review")
-GITHUB_ORIGIN = re.compile(r"github#([1-9][0-9]*)")
+_HOST = r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"
+_OWNER = r"[A-Za-z0-9][A-Za-z0-9-]*"
+_NAME = r"[A-Za-z0-9._-]+"
+_REPO = (rf"(?:(?P<host>{_HOST})/)?(?P<owner>{_OWNER})/(?P<name>{_NAME})")
+REPO_ARG = re.compile(_REPO)
+BOUND_ORIGIN = re.compile(rf"github:{_REPO}#(?P<n>[1-9][0-9]*)")
+GITHUB_ORIGIN = re.compile(r"github#([1-9][0-9]*)")      # 0.4.0, unbound
+WORD_ORIGIN = re.compile(r"[a-z]+")
+#: What may follow a GitHub origin on its line (`leading_origin`).
+ORIGIN_END = re.compile(r"(?:$|\s|;|\.(?:$|\s))")
+ISSUE_URL = re.compile(rf"https?://(?P<host>{_HOST})/(?P<owner>{_OWNER})/"
+                       rf"(?P<name>{_NAME})/issues/(?P<n>[1-9][0-9]*)")
+DEFAULT_HOST = "github.com"
 SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 PROVENANCE = re.compile(
     r"Deposited by (?P<by>[A-Za-z0-9][A-Za-z0-9._-]*), "
     r"(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})"
-    r"(?:, origin (?P<origin>[a-z]+(?:#[0-9]+)?))?")
+    r"(?:, origin (?P<origin>[a-z]+(?:[#:]\S*)?))?")
 QUEUE_README = "README.md"
+BIND_HINT = "bind it first: `park intake github --bind [--repo OWNER/NAME]`"
 
 
 class Refused(Exception):
@@ -527,17 +568,73 @@ class Refused(Exception):
         self.lines = lines
 
 
+class Repo:
+    """One GitHub repository. Equal by what GitHub treats as the same
+    repository: the host lower-cased, owner and name without regard to case.
+    Spelled as written, with the host left out on github.com."""
+
+    def __init__(self, host: str | None, owner: str, name: str):
+        self.host = (host or DEFAULT_HOST).lower()
+        self.owner, self.name = owner, name
+
+    @classmethod
+    def of(cls, m: re.Match) -> "Repo":
+        return cls(m["host"], m["owner"], m["name"])
+
+    def key(self) -> tuple[str, str, str]:
+        return (self.host, self.owner.casefold(), self.name.casefold())
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, Repo) and self.key() == other.key()
+
+    def __hash__(self) -> int:
+        return hash(self.key())
+
+    def __str__(self) -> str:
+        path = f"{self.owner}/{self.name}"
+        return path if self.host == DEFAULT_HOST else f"{self.host}/{path}"
+
+    def origin(self, n: int) -> str:
+        return f"github:{self}#{n}"
+
+
 def origin_valid(origin: str) -> bool:
-    return origin in ORIGINS or GITHUB_ORIGIN.fullmatch(origin) is not None
+    """In the vocabulary, the 0.4.0 `github#N` included: it is READ, so it
+    can be named and bound; `need_bound` refuses writing or acting on it."""
+    return (origin in ORIGINS or BOUND_ORIGIN.fullmatch(origin) is not None
+            or GITHUB_ORIGIN.fullmatch(origin) is not None)
 
 
 def origin_words() -> str:
-    return f"{', '.join(ORIGINS)}, github#<N>"
+    return f"{', '.join(ORIGINS)}, github:[HOST/]OWNER/NAME#<N>"
 
 
-def github_number(origin: str | None) -> int | None:
+def bound_origin(origin: str | None) -> tuple[Repo, int] | None:
+    m = BOUND_ORIGIN.fullmatch(origin or "")
+    return (Repo.of(m), int(m["n"])) if m else None
+
+
+def legacy_number(origin: str | None) -> int | None:
+    """N for a 0.4.0 `github#N` origin, which names no repository."""
     m = GITHUB_ORIGIN.fullmatch(origin or "")
     return int(m.group(1)) if m else None
+
+
+def issue_url(text: str | None) -> tuple[Repo, int] | None:
+    m = ISSUE_URL.fullmatch((text or "").strip())
+    return (Repo.of(m), int(m["n"])) if m else None
+
+
+WRITE_HINT = "write `github:OWNER/NAME#{n}` instead"
+
+
+def need_bound(origin: str | None, where: str, hint: str = BIND_HINT) -> None:
+    """Refuse a 0.4.0 `github#N` origin where park would write or act on
+    it; `hint` says what to do instead, `{n}` standing for its number."""
+    n = legacy_number(origin)
+    if n is not None:
+        raise Refused(refusal("PARK-E218", f"{where}: origin github#{n} names "
+                              f"no repository; {hint.format(n=n)}"))
 
 
 def parse_provenance(line: str, where: str) -> re.Match:
@@ -561,15 +658,40 @@ def parse_provenance(line: str, where: str) -> re.Match:
 
 
 def leading_origin(line: str) -> str | None:
-    """The origin a provenance line OPENS with, leniently: a brief's body may
-    continue that line with prose (`...; promoted by ...`). Answers only
-    "is this `github#N` recorded already?"."""
-    m = PROVENANCE.match(line.strip())
+    """The origin a provenance line OPENS with: a brief's body may continue
+    that line with prose (`...; promoted by ...`). The longest well-formed
+    origin at that place wins. A GitHub origin ends only at a DELIMITER —
+    the end of the line, whitespace, `;`, or a `.` that ends the line or
+    precedes whitespace — so one running on into more of a token
+    (`github:o/r#7x`, `#7-extra`, `#7/extra`, `#7.5`) names no issue and is
+    none. A word origin ends at anything but a letter, digit, `#` or `_`.
+    Answers only "which origin does this record?"; `malformed_github` is
+    the check."""
+    text = line.strip()
+    m = PROVENANCE.match(text)
     if m is None or m["origin"] is None:
         return None
-    after = line.strip()[m.end():][:1]
-    return None if after and (after.isalnum() or after in "#_") \
-        else m["origin"]
+    for shape in (BOUND_ORIGIN, GITHUB_ORIGIN, WORD_ORIGIN):
+        t = shape.match(text, m.start("origin"))
+        if t is not None:
+            break
+    rest = text[t.end():]
+    if shape is WORD_ORIGIN:
+        after = rest[:1]
+        return None if after and (after.isalnum() or after in "#_") \
+            else t.group(0)
+    return t.group(0) if ORIGIN_END.match(rest) else None
+
+
+def malformed_github(line: str) -> str | None:
+    """The origin text, when a provenance line declares a `github:` origin
+    that does not read as one; None otherwise (no provenance line, another
+    origin, or a well-formed one)."""
+    m = PROVENANCE.match(line.strip())
+    if m is None or m["origin"] is None or \
+            not m["origin"].startswith("github:"):
+        return None
+    return None if bound_origin(leading_origin(line)) else m["origin"]
 
 
 def one_line(value: str) -> bool:
@@ -651,11 +773,26 @@ def map_line(lines: list[str], where: str) -> str:
     return line
 
 
-def recorded_github() -> dict[int, str]:
-    """`github#N` -> where it is already recorded: a deposit's line 1, or
-    the first body line of a brief. Briefs are read leniently here (any file
-    whose frontmatter closes): this answers "seen before?", it validates
-    nothing.
+class Record(NamedTuple):
+    """One GitHub origin already recorded in the tree."""
+    path: Path
+    kind: str               # "deposit" or "brief"
+    index: int              # its provenance line, as an index into the lines
+    origin: str             # the origin as written
+    evidence: str | None    # the first non-blank line after the provenance
+                            # line (a deposit's map line skipped): where
+                            # 0.4.0's import wrote the issue's URL
+
+    @property
+    def rel(self) -> str:
+        return str(self.path.relative_to(ROOT))
+
+
+def github_records() -> list[Record]:
+    """Every GitHub origin, bound or 0.4.0, already recorded: on a deposit's
+    line 1, or the first body line of a brief. Briefs are read leniently
+    here (any file whose frontmatter closes): this answers "seen before?",
+    it validates nothing.
 
     Fail-closed on what it cannot SEE, lenient on what it cannot DECODE. A
     file or directory it cannot read might record the very issue asked
@@ -664,7 +801,17 @@ def recorded_github() -> dict[int, str]:
     decoded with replacement: the provenance line is ASCII, so no decoding
     choice can hide or forge one, and junk elsewhere in a file no longer
     hides the line it opens with."""
-    seen: dict[int, str] = {}
+    found: list[Record] = []
+
+    def note(path: Path, kind: str, lines: list[str], index: int,
+             skip: int) -> None:
+        origin = leading_origin(lines[index])
+        if bound_origin(origin) is None and legacy_number(origin) is None:
+            return
+        rest = [l.strip() for l in lines[index + 1 + skip:] if l.strip()]
+        found.append(Record(path, kind, index, origin,
+                            rest[0] if rest else None))
+
     for path in deposits():
         rel = path.relative_to(ROOT)
         try:
@@ -674,12 +821,11 @@ def recorded_github() -> dict[int, str]:
                                   f"cannot be checked for a github origin "
                                   f"({exc.strerror or type(exc).__name__})")) \
                 from None
-        first = raw.decode("utf-8", "replace").splitlines()[:1]
-        n = github_number(leading_origin(first[0]) if first else None)
-        if n is not None:
-            seen.setdefault(n, str(rel))
+        lines = raw.decode("utf-8", "replace").splitlines()
+        if lines:
+            note(path, "deposit", lines, 0, 1)
     if not BRIEFS.is_dir():
-        return seen
+        return found
     why = unlistable(BRIEFS)
     if why is not None:
         raise Refused(refusal("PARK-E114", f"{BRIEFS.relative_to(ROOT)}/: "
@@ -697,11 +843,33 @@ def recorded_github() -> dict[int, str]:
         fences = [i for i, l in enumerate(lines) if l.strip() == "---"]
         if len(fences) < 2 or fences[0] != 0:
             continue
-        body = [l for l in lines[fences[1] + 1:] if l.strip()]
-        n = github_number(leading_origin(body[0]) if body else None)
-        if n is not None:
-            seen.setdefault(n, str(path.relative_to(ROOT)))
-    return seen
+        first = next((i for i in range(fences[1] + 1, len(lines))
+                      if lines[i].strip()), None)
+        if first is not None:
+            note(path, "brief", lines, first, 0)
+    return found
+
+
+def recorded(records: list[Record]) -> tuple[dict, dict[int, list[str]]]:
+    """(repository, N) -> where a bound origin records it; N -> every file
+    whose 0.4.0 `github#N` origin could be recording it, for any
+    repository."""
+    bound: dict[tuple[Repo, int], str] = {}
+    legacy: dict[int, list[str]] = {}
+    for r in records:
+        b = bound_origin(r.origin)
+        if b is not None:
+            bound.setdefault(b, r.rel)
+        else:
+            legacy.setdefault(legacy_number(r.origin), []).append(r.rel)
+    return bound, legacy
+
+
+def unbound_conflict(legacy: dict[int, list[str]], repo: Repo,
+                     n: int) -> str:
+    return refusal("PARK-E218", f"{legacy[n][0]}: origin github#{n} names no "
+                   f"repository, so it cannot say whether {repo.origin(n)} "
+                   f"is recorded already; {BIND_HINT}")
 
 
 def scaffold(bid: str, btype: str, triggers: list[str], line: str,
@@ -770,6 +938,7 @@ def intake_list(args) -> int:
             lines = read_deposit(path)
             m = parse_provenance(lines[0], rel)
             line = map_line(lines, rel)
+            need_bound(m["origin"], rel)
             origin = m["origin"] or "none (promote needs --origin)"
             print(f"  {path.stem}  origin {origin}  {m['date']}  by "
                   f"{m['by']} — {line}")
@@ -829,14 +998,18 @@ def intake_deposit(args) -> int:
         raise Refused(refusal("PARK-E208", f"deposit: line 1 declares no "
                               f"origin; end it with `, origin <origin>` "
                               f"({origin_words()})"))
+    need_bound(m["origin"], "deposit", WRITE_HINT)
     survives(args.id, "task", [], map_line(lines, "deposit"))
-    n = github_number(m["origin"])
+    issue = bound_origin(m["origin"])
     # Only a github origin can be a duplicate; scanning for any other would
     # let an unreadable, unrelated file refuse an analyst's deposit.
-    seen = recorded_github() if n is not None else {}
-    if n is not None and n in seen:
-        raise Refused(refusal("PARK-E213", f"github#{n} is already recorded "
-                                           f"in {seen[n]}"))
+    if issue is not None:
+        seen, legacy = recorded(github_records())
+        if issue in seen:
+            raise Refused(refusal("PARK-E213", f"{m['origin']} is already "
+                                  f"recorded in {seen[issue]}"))
+        if issue[1] in legacy:
+            raise Refused(unbound_conflict(legacy, *issue))
     made: list[Path] = []
     new_dir = not INBOX.is_dir()
     try:
@@ -878,10 +1051,12 @@ def intake_promote(args) -> int:
         if not origin_valid(args.origin):
             raise Refused(refusal("PARK-E207", f"--origin {args.origin!r} is "
                                   f"not one of {origin_words()}"))
+        need_bound(args.origin, "--origin", WRITE_HINT)
         provenance += f", origin {args.origin}"
     elif args.origin is not None:
         raise Refused(refusal("PARK-E209", f"{rel}: line 1 already declares "
                               f"origin {m['origin']}; drop --origin"))
+    need_bound(m["origin"], rel)
     line = map_line(lines, rel)
     triggers = list(args.trigger or [])
     survives(args.id, args.type, triggers, line)
@@ -965,12 +1140,19 @@ def intake_reject(args) -> int:
 #
 # Inbound reads the forge and writes only local deposits: `gh issue list`
 # becomes one deposit per open issue not already recorded as `origin
-# github#N` (a deposit's line 1, or a brief body's first line). Outbound
-# prints a plan by default, reading issue state with `gh issue view`; only
-# `--apply` writes to the forge, one `gh issue close --comment` per planned
-# issue. No Project API is used, and nothing here runs on a schedule: every
-# run is someone's command. A rejected issue comes back on the next import
-# unless it is closed or filtered out with `--label`.
+# github:<repo>#N` (a deposit's line 1, or a brief body's first line), the
+# repository taken from the issue's own URL as the forge reports it, never
+# from how `--repo` was spelled. Outbound prints a plan by default: it names
+# its repository with `--repo`, sets aside every done brief bound to another
+# one without asking the forge anything about it, and reads each remaining
+# issue with `gh issue view`, planning a close only when the URL the forge
+# answers names that same repository and number. Only `--apply` writes to
+# the forge, one `gh issue close --comment` per planned issue. `--bind`
+# rewrites 0.4.0's `github#N` origins into the bound form, locally, from
+# the issue URL the import recorded below each one, or else from `--repo`.
+# No Project API is used, and nothing here runs on a schedule: every run is
+# someone's command. A rejected issue comes back on the next import unless
+# it is closed or filtered out with `--label`.
 
 GH_TIMEOUT = 120
 
@@ -1014,10 +1196,17 @@ def gh_json(exe: str, args: list[str], repo: str | None, shape):
     return data
 
 
+def url_names(item: dict) -> tuple[Repo, int] | None:
+    """(repository, N) from an answer's `url`, when it is issue N's URL."""
+    url = item.get("url")
+    where = issue_url(url) if isinstance(url, str) else None
+    return where if where and where[1] == item.get("number") else None
+
+
 def is_issue(item) -> bool:
     return (isinstance(item, dict) and type(item.get("number")) is int
             and item["number"] > 0 and isinstance(item.get("title"), str)
-            and isinstance(item.get("url"), str)
+            and url_names(item) is not None
             and isinstance(item.get("body"), (str, type(None))))
 
 
@@ -1045,20 +1234,28 @@ def github_inbound(args) -> int:
         fields += ["--label", args.label]
     issues = gh_json(exe, fields, args.repo,
                      lambda d: isinstance(d, list) and all(map(is_issue, d)))
-    seen = recorded_github()
+    seen, legacy = recorded(github_records())
+    new = [(url_names(item), item)
+           for item in sorted(issues, key=lambda i: i["number"])]
+    new = [(issue, item) for issue, item in new if issue not in seen]
+    # A 0.4.0 origin with the same number may be recording this very issue,
+    # or another repository's: importing would risk a duplicate, skipping
+    # would risk a loss, so neither is guessed at.
+    unbound = [unbound_conflict(legacy, *issue) for issue, _ in new
+               if issue[1] in legacy]
+    if unbound:
+        raise Refused(*unbound)
     today = datetime.date.today().isoformat()
     plan: list[tuple[Path, str]] = []
-    for item in sorted(issues, key=lambda i: i["number"]):
-        n = item["number"]
-        if n in seen:
-            continue
+    for (repo, n), item in new:
         path = deposit_path(issue_id(n, item["title"]))
         if path.exists():
             raise Refused(refusal("PARK-E304", f"{path.relative_to(ROOT)} "
-                                  f"exists and does not record github#{n}; "
-                                  f"nothing was written"))
+                                  f"exists and does not record "
+                                  f"{repo.origin(n)}; nothing was written"))
         body = "\n".join((item["body"] or "").splitlines()).strip()
-        plan.append((path, f"Deposited by park, {today}, origin github#{n}\n"
+        plan.append((path, f"Deposited by park, {today}, origin "
+                           f"{repo.origin(n)}\n"
                            f"{issue_line(n, item['title'])}\n\n"
                            f"{item['url']}\n"
                            + (f"\n{body}\n" if body else "")))
@@ -1084,34 +1281,61 @@ def github_inbound(args) -> int:
 
 
 def github_outbound(args) -> int:
+    dest: Repo = args.destination
     exe = gh_path()
     errors: list[str] = []
     briefs = load_briefs(errors)
     validate(briefs, errors)
     if errors:
         raise Refused(*errors)
-    todo = []
+    todo, elsewhere, unbound = [], [], []
     for bid, b in sorted(briefs.items()):
+        if b["status"] != "done":
+            continue
         body = [l for l in b["_body"].splitlines() if l.strip()]
-        n = github_number(leading_origin(body[0]) if body else None)
-        if n is not None and b["status"] == "done":
-            todo.append((n, b))
-    planned, skipped = [], []
-    for n, b in todo:
-        state = gh_json(exe, ["issue", "view", str(n), "--json",
-                              "number,state"], args.repo,
-                        lambda d: isinstance(d, dict)
-                        and isinstance(d.get("state"), str))["state"]
+        origin = leading_origin(body[0]) if body else None
+        issue = bound_origin(origin)
+        if issue is not None:
+            (todo if issue[0] == dest else elsewhere).append((issue, b))
+        elif legacy_number(origin) is not None:
+            unbound.append(refusal("PARK-E218", f"{b['_path']}: origin "
+                                   f"{origin} names no repository, so its "
+                                   f"issue can be closed in none; "
+                                   f"{BIND_HINT}"))
+    if unbound:
+        raise Refused(*unbound)
+    planned, skipped, moved = [], [], []
+    for (repo, n), b in todo:
+        data = gh_json(exe, ["issue", "view", str(n), "--json",
+                             "number,state,url"], args.repo,
+                       lambda d: isinstance(d, dict)
+                       and isinstance(d.get("state"), str)
+                       and isinstance(d.get("url"), str)
+                       and issue_url(d["url"]) is not None)
+        at = issue_url(data["url"])
         comment = (f"Closed by park: brief `{b['id']}` reached status done. "
                    f"{b['brief']}")
+        # The forge's own answer is the authority, held to the brief's own
+        # binding: a renamed or transferred repository, or a host `gh`
+        # resolves differently, answers with another URL, and nothing is
+        # closed on the strength of a guess.
+        if at != (repo, n):
+            moved.append((n, b["id"], at[0].origin(at[1]), repo.origin(n)))
+            continue
+        state = data["state"]
         (planned if state == "OPEN" else skipped).append(
             (n, b["id"], comment, state))
     print(f"park: plan — {len(planned)} issue(s) to close, {len(skipped)} "
-          f"not open")
+          f"not open, {len(elsewhere) + len(moved)} not in {dest}")
     for n, bid, comment, _ in planned:
         print(f"  close #{n} (brief {bid}) with comment: {comment}")
     for n, bid, _, state in skipped:
         print(f"  skip  #{n} (brief {bid}): {state.lower()}")
+    for (repo, n), b in elsewhere:
+        print(f"  skip  #{n} (brief {b['id']}): bound to {repo}, not {dest}")
+    for n, bid, answer, bound in moved:
+        print(f"  skip  #{n} (brief {bid}): the forge answers {answer}, not "
+              f"{bound}")
     if not args.apply:
         print("park: plan only; nothing was written. Re-run with --apply to "
               "make these closes.")
@@ -1132,13 +1356,137 @@ def github_outbound(args) -> int:
     return 0
 
 
+def rebound(text: str, index: int, n: int, repo: Repo) -> str | None:
+    """`text` with line `index`'s `github#n` origin, and nothing else,
+    rewritten to `repo`'s; None when that origin is not where it was read."""
+    lines = text.splitlines(keepends=True)
+    line = lines[index]
+    lead = len(line) - len(line.lstrip())
+    m = PROVENANCE.match(line[lead:])
+    old = f"github#{n}"
+    if m is None or m["origin"] is None:
+        return None
+    start = lead + m.start("origin")
+    if line[start:start + len(old)] != old:
+        return None
+    lines[index] = line[:start] + repo.origin(n) + line[start + len(old):]
+    if leading_origin(lines[index]) != repo.origin(n):
+        return None
+    return "".join(lines)
+
+
+def github_bind(args) -> int:
+    """The migration: every 0.4.0 `github#N` origin, bound to the repository
+    the issue URL recorded below it names (0.4.0's import wrote one), or,
+    for one that records none, to `--repo`. A plan by default; `--apply`
+    rewrites the origins and nothing else. No forge call: the proof is in
+    the files, or in the operator's `--repo`."""
+    dest: Repo | None = args.destination
+    records = github_records()
+    seen, _ = recorded(records)
+    problems: list[str] = []
+    plan = []
+    for r in records:
+        n = legacy_number(r.origin)
+        if n is None:
+            continue
+        proof = issue_url(r.evidence)
+        if proof is not None and proof[1] != n:
+            problems.append(refusal("PARK-E219", f"{r.rel}: origin github#{n}, "
+                                    f"but the issue URL recorded below it "
+                                    f"names #{proof[1]} ({r.evidence}); bind "
+                                    f"it by hand"))
+            continue
+        if proof is not None:
+            plan.append((r, proof[0], n, "its issue URL"))
+        elif dest is not None:
+            plan.append((r, dest, n, "--repo"))
+        else:
+            problems.append(refusal("PARK-E219", f"{r.rel}: origin github#{n} "
+                                    f"records no issue URL to prove its "
+                                    f"repository; name it with --repo "
+                                    f"OWNER/NAME"))
+    claimed: dict[tuple[Repo, int], str] = {}
+    writes = []
+    for r, repo, n, how in plan:
+        issue = (repo, n)
+        if issue in seen:
+            problems.append(refusal("PARK-E213", f"{r.rel}: github#{n} would "
+                                    f"bind to {repo.origin(n)}, already "
+                                    f"recorded in {seen[issue]}"))
+            continue
+        if issue in claimed:
+            problems.append(refusal("PARK-E219", f"{r.rel}: github#{n} would "
+                                    f"bind to {repo.origin(n)}, as "
+                                    f"{claimed[issue]} would; two origins "
+                                    f"cannot record one issue"))
+            continue
+        claimed[issue] = r.rel
+        code = "PARK-E217" if r.kind == "deposit" else "PARK-E102"
+        try:
+            raw = r.path.read_bytes()
+            text = raw.decode("utf-8")
+        except OSError as exc:
+            problems.append(refusal(code, f"{r.rel}: unreadable "
+                                    f"({exc.strerror or type(exc).__name__})"))
+            continue
+        except UnicodeDecodeError:
+            code = "PARK-E205" if r.kind == "deposit" else "PARK-E102"
+            problems.append(refusal(code, f"{r.rel}: not UTF-8 text, so it "
+                                    f"cannot be rewritten exactly; bind it "
+                                    f"by hand"))
+            continue
+        text = rebound(text, r.index, n, repo)
+        if text is None:
+            problems.append(refusal("PARK-E219", f"{r.rel}: github#{n} is not "
+                                    f"where it was read; re-run"))
+            continue
+        writes.append((r, raw, text.encode("utf-8"), repo, n, how))
+    if problems:
+        raise Refused(*problems)
+    print(f"park: bind — {len(writes)} github#N origin(s) to bind")
+    for r, _, _, repo, n, how in writes:
+        print(f"  bind {r.rel}: github#{n} -> {repo.origin(n)} ({how})")
+    if not args.apply:
+        print("park: plan only; nothing was written. Re-run with --apply to "
+              "rewrite these origins.")
+        return 0
+    restore: dict = {}
+    try:
+        for r, old, new, _, _, _ in writes:
+            restore[r.path] = old
+            r.path.write_bytes(new)
+    except OSError as exc:
+        rollback([], restore)
+        raise Refused(refusal("PARK-E214", f"binding failed ({exc}); every "
+                                           f"file was restored")) from None
+    print(f"park: applied — {len(writes)} origin(s) bound")
+    return 0
+
+
 def intake_github(args) -> int:
-    if args.apply and not args.outbound:
+    if args.outbound and args.bind:
+        raise Refused(refusal("PARK-E001", "--outbound and --bind are "
+                                           "separate runs"))
+    if args.apply and not (args.outbound or args.bind):
         raise Refused(refusal("PARK-E001", "--apply acts only with "
-                                           "--outbound"))
-    if args.outbound and args.label:
+                                           "--outbound or --bind"))
+    if (args.outbound or args.bind) and args.label:
         raise Refused(refusal("PARK-E001", "--label filters the inbound "
                                            "import only"))
+    if args.outbound and args.repo is None:
+        raise Refused(refusal("PARK-E001", "--outbound needs --repo "
+                              "[HOST/]OWNER/NAME, the repository whose issues "
+                              "it closes"))
+    args.destination = None
+    if args.repo is not None and (args.outbound or args.bind):
+        m = REPO_ARG.fullmatch(args.repo)
+        if m is None:
+            raise Refused(refusal("PARK-E001", f"--repo {args.repo!r} is not "
+                                  f"[HOST/]OWNER/NAME"))
+        args.destination = Repo.of(m)
+    if args.bind:
+        return github_bind(args)
     return github_outbound(args) if args.outbound else github_inbound(args)
 
 
@@ -1180,11 +1528,13 @@ def build_parser() -> Parser:
     p_rej.add_argument("id")
     p_rej.add_argument("--reason", required=True)
     p_gh = verbs.add_parser("github", help="open issues -> deposits; "
-                            "--outbound plans the closes, --apply makes them")
+                            "--outbound plans the closes, --bind the binding "
+                            "of 0.4.0 origins; --apply makes either")
     p_gh.add_argument("--repo", metavar="REPOSITORY")
     p_gh.add_argument("--label")
     p_gh.add_argument("--limit", type=issue_limit, default=100)
     p_gh.add_argument("--outbound", action="store_true")
+    p_gh.add_argument("--bind", action="store_true")
     p_gh.add_argument("--apply", action="store_true")
     return parser
 
@@ -1244,7 +1594,30 @@ def main(argv=None) -> int:
     if current == want:
         print(f"park: map already current ({len(briefs)} briefs)")
         return 0
-    TODO.write_text(want, encoding="utf-8")
+    try:
+        before = TODO.read_bytes() if TODO.is_file() else None
+    except OSError as exc:
+        print(refusal("PARK-E142", f"{TODO.name}: unreadable ({exc})"),
+              file=sys.stderr)
+        return 1
+    try:
+        TODO.write_text(want, encoding="utf-8")
+    except OSError as exc:
+        # Put back what a write that failed partway may have truncated; a
+        # write refused at open (a read-only file or directory) changed
+        # nothing, and the restore then fails the same way, harmlessly.
+        rollback([], {TODO: before})
+        try:
+            unchanged = (TODO.read_bytes() if TODO.is_file()
+                         else None) == before
+        except OSError:
+            unchanged = False
+        state = ("it is unchanged" if unchanged else "it may be partly "
+                 "written; run `park map` again once it can be written")
+        print(refusal("PARK-E143", f"{TODO.name}: cannot be written "
+                      f"({exc.strerror or type(exc).__name__}); {state}"),
+              file=sys.stderr)
+        return 1
     print(f"park: map written ({len(briefs)} briefs)")
     return 0
 

@@ -95,9 +95,24 @@ what would falsify it>
 ```
 
 `<origin>` is a closed vocabulary: `analyst`, `operator`, `script`,
-`review`, or `github#<N>` for issue N. It lives on that line only; there is
-no frontmatter field for it. A line 1 without `, origin ...` is the form
-written before 0.4.0; `promote` accepts it with an explicit `--origin`.
+`review`, or `github:<repo>#<N>` for issue N of one repository. `<repo>` is
+`OWNER/NAME` on github.com and `HOST/OWNER/NAME` on any other host
+(`github:acme/app#7`, `github:git.example.com/acme/app#7`); a host always
+carries a dot and an owner never does, so neither reads as the other, and
+owner and name compare without regard to case, as GitHub does. The origin
+lives on that line only; there is no frontmatter field for it. A line 1
+without `, origin ...` is the form written before 0.4.0; `promote` accepts
+it with an explicit `--origin`.
+
+`github#<N>`, with no repository, is the form park 0.4.0 wrote. park still
+reads it, so it can be found and bound, and refuses it (`PARK-E218`)
+wherever it would write it, deduplicate on it or close by it: `deposit`,
+`promote`, `list` (which marks such a deposit not promotable), an import
+meeting the same number, and outbound meeting a done brief that carries
+it. Bind them once with `park intake github --bind` (below). On a
+brief's provenance line, its first body line, `park validate` refuses a
+`github:` origin that does not parse (`PARK-E126`), since it would be
+neither deduplicated nor closed.
 
 ```
 park intake list                       # every deposit, and whether it promotes
@@ -108,8 +123,8 @@ park intake reject <id> --reason "..." # delete it, print one record line
 
 - `deposit` validates line 1 (a real date, an origin from the vocabulary)
   and line 2, and only ever CREATES: an existing deposit, an existing brief
-  of the same id, or an issue number already deposited or promoted is
-  refused.
+  of the same id, or an issue already deposited or promoted (the same
+  repository and number) is refused.
 - `promote` writes `briefs/<id>.md` with a scaffolded frontmatter
   (`type` from `--type`, default `task`; `status: open`, `owner: user`,
   `gate: []`, `triggers` from `--trigger`, `deferrals: []`, `brief:` from
@@ -135,35 +150,69 @@ park intake reject <id> --reason "..." # delete it, print one record line
   or stdin (`PARK-E217`), a deposit or the queue's listing (`PARK-E217`),
   a brief or `briefs/`'s listing (`PARK-E102`, `PARK-E114`), and
   `TODO.md` (`PARK-E142`). A directory park cannot list is refused, not
-  read as empty.
+  read as empty. A `TODO.md` that `park map` cannot write is refused as
+  well (`PARK-E143`), and left as it was.
 
 ### GitHub issues
 
 With the GitHub CLI (`gh`) installed and authenticated:
 
 ```
-park intake github [--repo OWNER/NAME] [--label L] [--limit N]
-park intake github --outbound [--repo OWNER/NAME]            # plan only
-park intake github --outbound --apply [--repo OWNER/NAME]    # make it so
+park intake github [--repo [HOST/]OWNER/NAME] [--label L] [--limit N]
+park intake github --outbound --repo [HOST/]OWNER/NAME          # plan only
+park intake github --outbound --repo [HOST/]OWNER/NAME --apply  # make it so
+park intake github --bind [--repo [HOST/]OWNER/NAME]            # plan only
+park intake github --bind [--repo [HOST/]OWNER/NAME] --apply    # make it so
 ```
 
 - **Inbound** reads the forge and writes only local files: each open issue
-  not already recorded as `origin github#<N>`, on a deposit's line 1 or a
-  brief's first body line, becomes one deposit, `gh-<N>-<title words>.md`,
-  its map line the issue's title. Nothing is written to GitHub.
-- **Outbound** looks for briefs whose provenance is `github#<N>` and whose
-  status is `done`, reads each issue's state, and prints the plan: which
-  open issues it would close, with the comment it would leave. Only
+  not already recorded as `origin github:<repo>#<N>`, on a deposit's line
+  1 or a brief's first body line, becomes one deposit,
+  `gh-<N>-<title words>.md`, its map line the issue's title. `<repo>` is
+  taken from the issue's URL as `gh` reports it, not from how `--repo` was
+  spelled, and the URL is kept below the map line. Nothing is written to
+  GitHub.
+- **Outbound** names its repository with `--repo`, which it requires. It
+  looks for briefs whose provenance is `github:<repo>#<N>` and whose
+  status is `done`. One bound to another repository is listed as skipped,
+  and the forge is not asked about it. For the rest it reads each issue
+  (`gh issue view`) and plans a close only when the issue's URL, as the
+  forge answers it, names that same repository and number. A renamed or
+  transferred repository, or a host `gh` resolves differently, answers with
+  another URL and is skipped, never closed on a guess. The plan lists
+  the open issues it would close, with the comment it would leave. Only
   `--apply` closes them (`gh issue close --reason completed --comment`),
   and an issue already closed is skipped, so a second run does nothing.
+- **Binding the 0.4.0 form** (`--bind`) rewrites each `github#<N>` origin
+  on a deposit's line 1 or a brief's first body line to
+  `github:<repo>#<N>`, and changes nothing else in the file. `<repo>` comes
+  from the issue URL on the first line below the origin (a deposit's map
+  line aside), where 0.4.0's import put it: the file's own record, so it
+  wins over `--repo`. An origin with no such URL is bound to `--repo`,
+  which then is the operator's word: 0.4.0 documented one briefs tree per
+  repository. It prints the plan by default and rewrites only with
+  `--apply`, all of it or nothing. It asks the forge nothing and needs no
+  `gh`. It refuses (`PARK-E219`, nothing written) an origin with no URL
+  when no `--repo` is given, a URL naming another number, and two origins
+  that would bind to one issue. It refuses binding to an issue already
+  recorded in the bound form (`PARK-E213`), and a file it cannot decode
+  (`PARK-E205` for a deposit, `PARK-E102` for a brief). For example, a
+  brief opening
+  `Deposited by park, 2026-09-23, origin github#7` over the line
+  `https://github.com/acme/app/issues/7` becomes
+  `Deposited by park, 2026-09-23, origin github:acme/app#7`.
 - Nothing is scheduled and there is no Project-board sync: every run is
   someone's command.
 
-Limits, stated: `github#<N>` names an issue in the repository `gh` is
-pointed at, so one briefs tree follows one repository. A rejected issue
-comes back on the next import unless it is closed or excluded with
-`--label`. If a close fails partway through `--apply`, the closes before
-it stay made; the refusal names them.
+Limits, stated: an origin names the repository as it was named at import.
+After a rename, outbound skips its briefs as bound elsewhere; edit the
+origin by hand to the new name. A deposit's id carries the issue number
+and title, not the repository. So when two repositories' issues share both,
+the second import refuses (`PARK-E304`) while the first deposit waits, and
+`promote` refuses (`PARK-E204`) once it is a brief. A rejected issue comes
+back on the next import unless it is closed or excluded with `--label`. If
+a close fails partway through `--apply`, the closes before it stay made;
+the refusal names them.
 
 ## Refusal codes
 
@@ -194,6 +243,7 @@ never reused.
 | `PARK-E123` | the `brief` line is empty |
 | `PARK-E124` | a watch whose status is not open |
 | `PARK-E125` | a watch without a trigger |
+| `PARK-E126` | a provenance line whose `github:` origin is not `github:[HOST/]OWNER/NAME#N` |
 | `PARK-E130` | a `manual:` gate carrying no checkable fact |
 | `PARK-E131` | a gate that references its own brief |
 | `PARK-E132` | a gate that resolves to no brief |
@@ -202,6 +252,7 @@ never reused.
 | `PARK-E140` | `TODO.md` carries no generated region (`map --check`) |
 | `PARK-E141` | `TODO.md` is stale against the briefs (`map --check`) |
 | `PARK-E142` | `TODO.md` cannot be read as UTF-8 text |
+| `PARK-E143` | `TODO.md` cannot be written (`map`) |
 | `PARK-E201` | a deposit id that is not a lowercase kebab slug |
 | `PARK-E202` | no such deposit in `briefs/inbox/` (the queue's README, in any spelling, is none) |
 | `PARK-E203` | the deposit already exists (deposits are create-only) |
@@ -214,11 +265,13 @@ never reused.
 | `PARK-E210` | line 2, the map line, is missing or blank |
 | `PARK-E211` | a scaffolded value is blank, multi-line, padded, or does not read back as itself |
 | `PARK-E212` | a rejection reason that is blank or not one line |
-| `PARK-E213` | that `github#N` origin is already deposited or promoted |
+| `PARK-E213` | that GitHub origin is already deposited or promoted |
 | `PARK-E214` | a write failed; every file was restored |
 | `PARK-E215` | promotion refused: the tree would not validate |
 | `PARK-E216` | a deposit id reserved for the queue's README, in any letter case |
 | `PARK-E217` | an intake input cannot be read: the `--file` or stdin text, a deposit, or the `briefs/inbox/` listing |
+| `PARK-E218` | a `github#N` origin, the 0.4.0 form, names no repository: bind it first (`intake github --bind`) |
+| `PARK-E219` | `--bind` cannot prove a `github#N` origin's repository: no issue URL and no `--repo`, a URL naming another number, or two origins binding to one issue |
 | `PARK-E301` | `gh` is not on PATH |
 | `PARK-E302` | `gh` failed or timed out |
 | `PARK-E303` | `gh` answered something other than the expected JSON |

@@ -4,6 +4,55 @@ The version is a human judgment, bumped deliberately inside the change that
 will be published — it is never derived mechanically from commit types — and
 `--version` must discriminate any two published trees. Newest first.
 
+## 0.4.1
+
+**A GitHub origin names its repository.** 0.4.0 recorded an imported
+issue as `origin github#<N>`, a number with no repository. It deduplicated
+imports by that number alone, and `--outbound --apply` closed issue N in
+whatever repository `gh` was pointed at. A done brief imported from one
+repository could therefore close the same number in another. The origin is
+now `github:<repo>#<N>`: `github:OWNER/NAME#7` on github.com, and
+`github:HOST/OWNER/NAME#7` elsewhere. Inbound takes the repository from
+each issue's URL as the forge reports it, and deduplicates on repository
+and number. Outbound requires `--repo`. It asks the forge nothing about a
+done brief bound to another repository, and closes an issue only when the
+URL `gh issue view` answers names that same repository and number. A
+renamed or transferred repository, or one `gh` resolves to another host,
+is skipped rather than closed. `park validate` refuses a `github:` origin
+that does not parse (`PARK-E126`).
+
+**The 0.4.0 form is bound by one command, never silently.** `park intake
+github --bind` prints the rewrite of every `github#<N>` origin, on a
+deposit's line 1 or a brief's first body line, and `--apply` makes it,
+changing nothing else in any file. It asks the forge nothing. The
+repository comes from the issue URL that 0.4.0's import recorded below the
+origin, or, for an origin without one, from `--repo`. It refuses
+(`PARK-E219`, nothing written) when neither is there, when that URL names
+another number, and when two origins would bind to one issue. Until then,
+park reads a `github#<N>` origin but will not act on it (`PARK-E218`).
+`deposit` and `promote` refuse to write one, an import meeting the same
+number refuses rather than guess whether it is a duplicate, and outbound
+refuses a done brief that carries one, before any forge call.
+
+**`park map` refuses a `TODO.md` it cannot write.** A write failure was
+an uncoded traceback. It is now `PARK-E143`, exit 1 like every other
+refusal, and the file is left as it was. A current `TODO.md` still passes
+without being written, and `map --check` is unchanged.
+
+### Upgrading from 0.4.0
+
+- **Run `park intake github --bind` once, then `--bind --apply`,** if any
+  deposit or brief carries `origin github#<N>`. Those that 0.4.0 imported
+  carry their issue URL and need nothing else; add `--repo OWNER/NAME` for
+  any written by hand. Until they are bound, `promote`, the import and
+  outbound refuse them with `PARK-E218`.
+- **`--outbound` needs `--repo`.** Without it the run is a usage refusal
+  (`PARK-E001`, exit 2). Name the host too, `--repo HOST/OWNER/NAME`, for a
+  repository outside github.com.
+- **Anything matching `origin github#` should match `origin github:`.**
+  A new deposit, a brief promoted from one, and an import all write the
+  bound form.
+
 ## 0.4.0
 
 **park requires Python 3.15.** `requires-python` is now `>=3.15,<3.16`,
