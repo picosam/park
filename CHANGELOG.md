@@ -4,6 +4,18 @@ The version is a human judgment, bumped deliberately inside the change that
 will be published — it is never derived mechanically from commit types — and
 `--version` must discriminate any two published trees. Newest first.
 
+## 0.4.2
+
+Documentation only: `bin/park` behaves exactly as 0.4.1.
+
+**The onboarding prompt states each rule once.** Another tool's onboarding
+may have written the instruction file first. `prompts/onboard.md` §5 now
+adds the index to its list of generated files, and makes its branch and
+push rule true, instead of adding a second. The commit line it proposes
+for a new file admits a push through a push verb of a tool the file names,
+so it no longer contradicts a review tool that pushes the branch it hands
+off.
+
 ## 0.4.1
 
 **A GitHub origin names its repository.** 0.4.0 recorded an imported

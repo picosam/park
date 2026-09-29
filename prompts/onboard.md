@@ -166,7 +166,8 @@ Three topologies, three different answers:
   minimal repository instruction file carrying only the operating floor:
   the five repairs above (they are the floor for a backlog repository),
   plus one line of commit discipline — work on the agreed branch, commit
-  logical units, push only on the owner's explicit request. Global rules
+  logical units, push only on the owner's explicit request or through a
+  push verb of a tool the file names. Global rules
   keep covering only what is genuinely generic (tone, language, personal
   style).
 - **Nothing is loaded anywhere.** Propose the same minimal repository
@@ -175,6 +176,13 @@ Three topologies, three different answers:
 
 Nothing else is injected in either repository-absent branch: no language
 rules, no roles, no house style — those are the owner's to add or not.
+
+**One statement per rule, whichever tool wrote it.** Another tool's
+onboarding may have written the file first. Where it already names
+generated files, add the index to that list rather than starting a second
+one; where it already states a branch and push rule, make that rule true
+rather than adding the commit line beside it. The same holds when the
+repository carried its instruction file before either tool.
 
 **Offered, and bounded — the optimization pass.** While you are in these
 files, *propose* improvements against these criteria — the ones that make an

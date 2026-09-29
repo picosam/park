@@ -83,7 +83,7 @@ from typing import NamedTuple
 # deliberately inside the change that will be published — never derived
 # mechanically from commit types — and --version must discriminate any two
 # published trees.
-PARK_VERSION = "0.4.1"
+PARK_VERSION = "0.4.2"
 
 def find_root() -> Path:
     """The nearest ancestor (working directory upward) carrying `briefs/`.
