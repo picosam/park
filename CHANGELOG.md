@@ -4,6 +4,26 @@ The version is a human judgment, bumped deliberately inside the change that
 will be published — it is never derived mechanically from commit types — and
 `--version` must discriminate any two published trees. Newest first.
 
+## 0.4.3
+
+**Two repositories' issues of one number and title both import.** 0.4.1
+bound each origin to its repository, but a deposit's id still carried only
+the number and title, so the second repository's issue was refused
+(`PARK-E304`) while the first waited in the queue, and refused again at
+`promote` (`PARK-E204`) once the first was a brief. Inbound now keeps
+`gh-<N>-<title words>` while nothing holds it, and when a deposit or a brief
+holding it records another issue's origin, names the repository too:
+`gh-<repo words>-<N>-<title words>`. Words alone lose the owner/name
+boundary and a name's punctuation, so when that id is held the same way,
+the repository's words are followed by 8 hex digits of its identity. A
+file at an id recording no other
+issue still refuses (`PARK-E304`): it may be the same issue with its first
+line edited. Three names is the whole allocation: when all three are held
+by other issues, which takes repository names built to collide on both the
+words and the 8 hex digits, the import refuses (`PARK-E304`), writes
+nothing, and the issue is deposited by hand (`intake deposit`). Existing
+deposits and briefs keep their names.
+
 ## 0.4.2
 
 Documentation only: `bin/park` behaves exactly as 0.4.1.

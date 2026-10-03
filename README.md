@@ -167,8 +167,14 @@ park intake github --bind [--repo [HOST/]OWNER/NAME] --apply    # make it so
 
 - **Inbound** reads the forge and writes only local files: each open issue
   not already recorded as `origin github:<repo>#<N>`, on a deposit's line
-  1 or a brief's first body line, becomes one deposit,
-  `gh-<N>-<title words>.md`, its map line the issue's title. `<repo>` is
+  1 or a brief's first body line, becomes one deposit (unless all three
+  of its names are held, as the limits below say),
+  `gh-<N>-<title words>.md`, its map line the issue's title. When another
+  repository's issue already holds that name, as a deposit or a brief, the
+  deposit is `gh-<repo words>-<N>-<title words>.md` instead; and when that
+  is held too, because two repositories' names spell the same words
+  (`o-b/c` and `o/b-c`, `o/r.name` and `o/r_name`), it is
+  `gh-<repo words>-<8 hex of the repository>-<N>-<title words>.md`. `<repo>` is
   taken from the issue's URL as `gh` reports it, not from how `--repo` was
   spelled, and the URL is kept below the map line. Nothing is written to
   GitHub.
@@ -206,10 +212,15 @@ park intake github --bind [--repo [HOST/]OWNER/NAME] --apply    # make it so
 
 Limits, stated: an origin names the repository as it was named at import.
 After a rename, outbound skips its briefs as bound elsewhere; edit the
-origin by hand to the new name. A deposit's id carries the issue number
-and title, not the repository. So when two repositories' issues share both,
-the second import refuses (`PARK-E304`) while the first deposit waits, and
-`promote` refuses (`PARK-E204`) once it is a brief. A rejected issue comes
+origin by hand to the new name. A file holding an issue's deposit id that
+records no other issue's origin may be that very issue with its first line
+edited, so the import refuses (`PARK-E304`) rather than make a second copy.
+An issue has three names, and when all three are held by other issues the
+import refuses (`PARK-E304`) and writes nothing: that takes two repositories
+whose names spell the same words and share the 8 hex digits, names built to
+collide. Deposit such an issue by hand under a name of your choosing
+(`park intake deposit`) with its `github:` origin, which later imports then
+recognise. A rejected issue comes
 back on the next import unless it is closed or excluded with `--label`. If
 a close fails partway through `--apply`, the closes before it stay made;
 the refusal names them.
@@ -275,7 +286,7 @@ never reused.
 | `PARK-E301` | `gh` is not on PATH |
 | `PARK-E302` | `gh` failed or timed out |
 | `PARK-E303` | `gh` answered something other than the expected JSON |
-| `PARK-E304` | a deposit file for an issue exists without its origin |
+| `PARK-E304` | an issue's deposit ids are held: one by a file recording no other issue's origin (it may be that issue's), or all three by other issues |
 | `PARK-E305` | an outbound close failed; the ones before it were made |
 
 ## Install

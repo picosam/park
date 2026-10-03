@@ -65,6 +65,7 @@ Once nothing is left below the marker, the whole file is generated.
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -83,7 +84,7 @@ from typing import NamedTuple
 # deliberately inside the change that will be published — never derived
 # mechanically from commit types — and --version must discriminate any two
 # published trees.
-PARK_VERSION = "0.4.2"
+PARK_VERSION = "0.4.3"
 
 def find_root() -> Path:
     """The nearest ancestor (working directory upward) carrying `briefs/`.
@@ -185,7 +186,9 @@ CODES = {
     "PARK-E301": "`gh` is not on PATH",
     "PARK-E302": "`gh` failed or timed out",
     "PARK-E303": "`gh` answered something other than the expected JSON",
-    "PARK-E304": "a deposit file for an issue exists without its origin",
+    "PARK-E304": "an issue's deposit ids are held: one by a file recording "
+                 "no other issue's origin (it may be that issue's), or all "
+                 "three by other issues",
     "PARK-E305": "an outbound close failed; the ones before it were made",
 }
 
@@ -1210,9 +1213,59 @@ def is_issue(item) -> bool:
             and isinstance(item.get("body"), (str, type(None))))
 
 
-def issue_id(number: int, title: str) -> str:
+def issue_id(number: int, title: str, repo: Repo | None = None,
+             fingerprint: bool = False) -> str:
+    """`gh-<N>-<title words>`; with `repo`, `gh-<repo words>-<N>-<title
+    words>`; with `fingerprint` too, the repository's words followed by 8 hex
+    digits of its identity (host, owner and name as GitHub compares them).
+    Words alone lose the owner/name boundary and a name's punctuation, so
+    `o-b/c` and `o/b-c`, or `o/r.name` and `o/r_name`, spell the same words;
+    the fingerprint tells them apart."""
     slug = "-".join(re.findall(r"[a-z0-9]+", title.lower()))[:40].strip("-")
-    return f"gh-{number}" + (f"-{slug}" if slug else "")
+    where = ""
+    if repo is not None:
+        where = "-".join(re.findall(r"[a-z0-9]+", str(repo).lower())) + "-"
+        if fingerprint:
+            where += hashlib.sha256("/".join(repo.key()).encode(
+                "utf-8")).hexdigest()[:8] + "-"
+    return f"gh-{where}{number}" + (f"-{slug}" if slug else "")
+
+
+def issue_deposit_path(repo: Repo, n: int, title: str,
+                       origin_at: dict[Path, str]) -> Path:
+    """Where issue N of `repo` is deposited (0.4.3). The short id while no
+    deposit or brief holds it; when one does and records ANOTHER issue's
+    bound origin, the id that names the repository too, and when that is
+    held the same way (two repositories whose names spell the same words),
+    the id carrying the repository's fingerprint. So issues of one number
+    and title can wait in the queue together, and all promote, from
+    repositories whose words or fingerprints differ. Three ids is the whole
+    allocation: when all three are held by other issues (two repositories
+    whose words and 8-digit fingerprints both match, which takes names
+    built to collide), the import refuses (E304) and writes nothing, and
+    that issue is deposited by hand under an id of the operator's choosing
+    (`intake deposit`); its origin then dedupes later imports. A holder
+    recording no other issue's origin may be this issue with its
+    provenance edited away: that refuses (E304), as before 0.4.3, rather
+    than make a second copy of it."""
+    ids = (issue_id(n, title), issue_id(n, title, repo),
+           issue_id(n, title, repo, fingerprint=True))
+    for did in ids:
+        holders = [h for h in (deposit_path(did), BRIEFS / f"{did}.md")
+                   if h.exists()]
+        if not holders:
+            return deposit_path(did)
+        for h in holders:
+            other = bound_origin(origin_at.get(h))
+            if other is None or other == (repo, n):
+                raise Refused(refusal("PARK-E304", f"{h.relative_to(ROOT)} "
+                                      f"exists and does not record another "
+                                      f"issue, so it may be "
+                                      f"{repo.origin(n)}'s; nothing was "
+                                      f"written"))
+    raise Refused(refusal("PARK-E304", f"every id for {repo.origin(n)} is "
+                          f"held by another issue ({', '.join(ids)}); "
+                          f"nothing was written"))
 
 
 def issue_line(number: int, title: str) -> str:
@@ -1234,7 +1287,9 @@ def github_inbound(args) -> int:
         fields += ["--label", args.label]
     issues = gh_json(exe, fields, args.repo,
                      lambda d: isinstance(d, list) and all(map(is_issue, d)))
-    seen, legacy = recorded(github_records())
+    records = github_records()
+    seen, legacy = recorded(records)
+    origin_at = {r.path: r.origin for r in records}
     new = [(url_names(item), item)
            for item in sorted(issues, key=lambda i: i["number"])]
     new = [(issue, item) for issue, item in new if issue not in seen]
@@ -1248,11 +1303,7 @@ def github_inbound(args) -> int:
     today = datetime.date.today().isoformat()
     plan: list[tuple[Path, str]] = []
     for (repo, n), item in new:
-        path = deposit_path(issue_id(n, item["title"]))
-        if path.exists():
-            raise Refused(refusal("PARK-E304", f"{path.relative_to(ROOT)} "
-                                  f"exists and does not record "
-                                  f"{repo.origin(n)}; nothing was written"))
+        path = issue_deposit_path(repo, n, item["title"], origin_at)
         body = "\n".join((item["body"] or "").splitlines()).strip()
         plan.append((path, f"Deposited by park, {today}, origin "
                            f"{repo.origin(n)}\n"
