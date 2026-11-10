@@ -4,7 +4,7 @@
 status and blockers, and a compiled index your agent reads on demand — instead
 of loading your entire TODO into every session.
 
-Markdown with YAML frontmatter. Python standard library only: one file, no
+Markdown with frontmatter. Python standard library only: one file, no
 dependencies, no service, nothing to log into. Delete the tool tomorrow and you
 still have plain markdown that reads fine.
 
@@ -30,14 +30,13 @@ One file per topic, under `briefs/`:
 
 ```markdown
 ---
-id: retire-legacy-exporter     # unique; matches the filename
-type: task                     # task | decision | watch | record | procedure
-status: parked                 # open | parked | done | superseded
-owner: agent                   # agent | user — whose move is it?
-gate: [new-export-pipeline]    # blockers, as brief ids
-triggers: []                   # prose events, for armed watches
-deferrals: []                  # ids of prior decisions this brief is the
-                                # live destination for (at most one owner)
+id: retire-legacy-exporter
+type: task
+status: parked
+owner: agent
+gate: [new-export-pipeline]
+triggers: []
+deferrals: []
 brief: Retire the legacy exporter once the new pipeline carries production.
 ---
 
@@ -45,13 +44,54 @@ The body: why, what was decided, what would falsify it. Links other briefs
 by [[id]]. Cites where it came from.
 ```
 
+A gate names a brief, so the one it waits on needs its own file:
+
+```markdown
+---
+id: new-export-pipeline
+type: task
+status: open
+owner: agent
+gate: []
+triggers: []
+deferrals: []
+brief: Build the new export pipeline.
+---
+
+Why it is needed, and how we will know it carries production.
+```
+
+Save both in `briefs/`, make the directory if you have none, and
+`park validate` passes.
+
+The frontmatter looks like YAML and is not: park reads its own smaller grammar,
+and only park should read it. A value may hold a second colon, which a YAML
+parser refuses (`brief: Next (agent): retire it.`), and a `#` after a value is
+part of the value, so the keys are explained here rather than beside them.
+Each key opens its line. A value wrapped in one pair of quotes, `"…"` or
+`'…'`, is read without them, and only then: `"Alpha" and "Beta"` reads as
+written. A list is `[a, b]`, or one `- item` per line under its key; a quoted
+item may hold a comma, and an empty item is refused.
+
+- `id`: matches the filename, so it is unique; letters, digits, `.`, `_` and
+  `-` only, since the index links to it.
+- `type`: `task`, `decision`, `watch`, `record` or `procedure`. A watch is
+  armed, not worked, so it stays `open` and cannot close: to retire one,
+  retype it (to `record`, say), then close it.
+- `status`: `open`, `parked`, `done` or `superseded`.
+- `owner`: `agent` or `user`: whose move is it?
+- `gate`: blockers, as brief ids.
+- `triggers`: prose events, for armed watches.
+- `deferrals`: ids of prior decisions this brief is the live destination
+  for (at most one owner).
+
 The `brief:` line is what gets compiled into the index. An agent reads the
 index, then opens the **one** brief it needs.
 
 ## What the tool does
 
 ```
-park validate        # schema, closed vocabularies, unique ids, gates resolve
+park validate        # schema, closed vocabularies, unique ids, gates resolve, no cycles
 park map             # compile briefs/ into the index (TODO.md)
 park map --check     # non-zero when the index and the briefs disagree
 park intake ...      # the deposit queue, briefs/inbox/, and GitHub issues
@@ -104,23 +144,30 @@ lives on that line only; there is no frontmatter field for it. A line 1
 without `, origin ...` is the form written before 0.4.0; `promote` accepts
 it with an explicit `--origin`.
 
-`github#<N>`, with no repository, is the form park 0.4.0 wrote. park still
-reads it, so it can be found and bound, and refuses it (`PARK-E218`)
-wherever it would write it, deduplicate on it or close by it: `deposit`,
-`promote`, `list` (which marks such a deposit not promotable), an import
-meeting the same number, and outbound meeting a done brief that carries
-it. Bind them once with `park intake github --bind` (below). On a
-brief's provenance line, its first body line, `park validate` refuses a
+`github#<N>`, with no repository, is the form park 0.4.0 wrote. park refuses
+it (`PARK-E218`) wherever it would write it, deduplicate on it or close by it:
+`deposit`, `promote`, `list` (which marks such a deposit not promotable), an
+import meeting the same number, and outbound meeting a done brief that carries
+it. If you have one, edit it by hand to `github:<repo>#<N>`; the issue's URL
+sits below the map line. On a brief's provenance line, its first body line, `park validate` refuses a
 `github:` origin that does not parse (`PARK-E126`), since it would be
 neither deduplicated nor closed.
 
 ```
-park intake list                       # every deposit, and whether it promotes
+park intake list                       # every deposit, what promote's checks say of it
 park intake deposit <id> < text.md     # create briefs/inbox/<id>.md (or --file)
 park intake promote <id> [--type T] [--trigger TEXT]... [--origin O]
 park intake reject <id> --reason "..." # delete it, print one record line
 ```
 
+- `list` runs `promote`'s checks of each deposit and validates the tree
+  with it added, as `promote` does, and no more: it reads no `TODO.md`, so
+  a `TODO.md` that `promote` refuses (`PARK-E142`, `PARK-E144`) or cannot
+  write shows at `promote` alone. It also names each other file waiting in
+  `briefs/inbox/` (not a dotfile, not the README) as not a deposit: rename
+  it to `<id>.md` to promote it, or remove it by hand.
+- `deposit` and the GitHub import need `briefs/` to exist already
+  (`PARK-E101`).
 - `deposit` validates line 1 (a real date, an origin from the vocabulary)
   and line 2, and only ever CREATES: an existing deposit, an existing brief
   of the same id, or an issue already deposited or promoted (the same
@@ -130,9 +177,15 @@ park intake reject <id> --reason "..." # delete it, print one record line
   `gate: []`, `triggers` from `--trigger`, `deferrals: []`, `brief:` from
   line 2), opens its body with the provenance line, regenerates the index
   and deletes the deposit. It is all of that or none of it: on any refusal
-  or failed write, every file is left byte-identical to before. It never
-  overwrites a brief, and it refuses a promotion the tree would not
-  validate.
+  or failed write, every file is left byte-identical to before, and an
+  interrupt (SIGINT, SIGTERM, SIGHUP) that arrives while it writes is held
+  until the promotion is whole, then ends the run; `deposit` holds one the
+  same way. Where signals cannot be held (Windows), they are not. SIGKILL
+  or a crash can still leave the brief and the deposit both, and `promote`
+  then refuses `PARK-E204`: keep the brief if `park validate` passes, then
+  run `park map` and reject the deposit; otherwise remove the brief and
+  promote again. It never overwrites a brief, and it refuses a promotion
+  the tree would not validate.
 - `reject` deletes the deposit and prints one line naming it, its
   provenance and your reason. It writes no record file: keep the line
   where you keep decisions (a commit message, a chat). A deposit it
@@ -152,24 +205,39 @@ park intake reject <id> --reason "..." # delete it, print one record line
   `TODO.md` (`PARK-E142`). A directory park cannot list is refused, not
   read as empty. A `TODO.md` that `park map` cannot write is refused as
   well (`PARK-E143`), and left as it was.
+- `TODO.md` is replaced whole, so a reader never gets part of it. `map` and
+  `promote` lock `briefs/` while they read and rewrite it; `validate` and
+  `map --check` wait for them. Where the filesystem has no `flock`, they run
+  unlocked.
+- One GitHub issue, one record. `deposit`, the inbound import and `promote`
+  each hold the same lock from the check that no other file records the
+  origin (`PARK-E213`, or `PARK-E218` for a `github#<N>` that might) to the
+  file written, so two of them running at once cannot both pass it.
+  `promote` asks it too, of every file but the deposit itself: `--origin`
+  adds an origin, and a deposit written into the queue by hand never met
+  `deposit`'s check.
 
 ### GitHub issues
 
-With the GitHub CLI (`gh`) installed and authenticated:
+This code is frozen: it keeps working and takes no new features. One known
+flaw stays with it: the import reads a brief whose status is quoted
+(`status: "done"`) as still live, so it reads that brief's issue from the
+forge where it need not. With the GitHub CLI (`gh`) installed and
+authenticated:
 
 ```
-park intake github [--repo [HOST/]OWNER/NAME] [--label L] [--limit N]
+park intake github [--repo [HOST/]OWNER/NAME] [--label L] [--limit N] [--with-commented]
 park intake github --outbound --repo [HOST/]OWNER/NAME          # plan only
 park intake github --outbound --repo [HOST/]OWNER/NAME --apply  # make it so
-park intake github --bind [--repo [HOST/]OWNER/NAME]            # plan only
-park intake github --bind [--repo [HOST/]OWNER/NAME] --apply    # make it so
 ```
 
 - **Inbound** reads the forge and writes only local files: each open issue
   not already recorded as `origin github:<repo>#<N>`, on a deposit's line
   1 or a brief's first body line, becomes one deposit (unless all three
   of its names are held, as the limits below say),
-  `gh-<N>-<title words>.md`, its map line the issue's title. When another
+  `gh-<N>-<title words>.md`, its map line the issue's title. An open issue
+  with a comment counts as handed off and stays on the forge unless you pass
+  `--with-commented`; the summary counts them. When another
   repository's issue already holds that name, as a deposit or a brief, the
   deposit is `gh-<repo words>-<N>-<title words>.md` instead; and when that
   is held too, because two repositories' names spell the same words
@@ -178,6 +246,10 @@ park intake github --bind [--repo [HOST/]OWNER/NAME] --apply    # make it so
   taken from the issue's URL as `gh` reports it, not from how `--repo` was
   spelled, and the URL is kept below the map line. Nothing is written to
   GitHub.
+- It then names each deposit or live brief whose issue is no longer open,
+  which takes one forge read per origin the list left out, and changes
+  nothing: closing or rejecting it stays yours. A read that fails is said
+  and stops nothing.
 - **Outbound** names its repository with `--repo`, which it requires. It
   looks for briefs whose provenance is `github:<repo>#<N>` and whose
   status is `done`. One bound to another repository is listed as skipped,
@@ -189,24 +261,6 @@ park intake github --bind [--repo [HOST/]OWNER/NAME] --apply    # make it so
   the open issues it would close, with the comment it would leave. Only
   `--apply` closes them (`gh issue close --reason completed --comment`),
   and an issue already closed is skipped, so a second run does nothing.
-- **Binding the 0.4.0 form** (`--bind`) rewrites each `github#<N>` origin
-  on a deposit's line 1 or a brief's first body line to
-  `github:<repo>#<N>`, and changes nothing else in the file. `<repo>` comes
-  from the issue URL on the first line below the origin (a deposit's map
-  line aside), where 0.4.0's import put it: the file's own record, so it
-  wins over `--repo`. An origin with no such URL is bound to `--repo`,
-  which then is the operator's word: 0.4.0 documented one briefs tree per
-  repository. It prints the plan by default and rewrites only with
-  `--apply`, all of it or nothing. It asks the forge nothing and needs no
-  `gh`. It refuses (`PARK-E219`, nothing written) an origin with no URL
-  when no `--repo` is given, a URL naming another number, and two origins
-  that would bind to one issue. It refuses binding to an issue already
-  recorded in the bound form (`PARK-E213`), and a file it cannot decode
-  (`PARK-E205` for a deposit, `PARK-E102` for a brief). For example, a
-  brief opening
-  `Deposited by park, 2026-09-23, origin github#7` over the line
-  `https://github.com/acme/app/issues/7` becomes
-  `Deposited by park, 2026-09-23, origin github:acme/app#7`.
 - Nothing is scheduled and there is no Project-board sync: every run is
   someone's command.
 
@@ -221,7 +275,7 @@ whose names spell the same words and share the 8 hex digits, names built to
 collide. Deposit such an issue by hand under a name of your choosing
 (`park intake deposit`) with its `github:` origin, which later imports then
 recognise. A rejected issue comes
-back on the next import unless it is closed or excluded with `--label`. If
+back on the next import unless it is closed, commented or excluded with `--label`. If
 a close fails partway through `--apply`, the closes before it stay made;
 the refusal names them.
 
@@ -229,12 +283,13 @@ the refusal names them.
 
 Every refusal line opens with a stable code. Name the code, not the prose,
 in anything that reacts to a refusal: messages may be reworded, codes are
-never reused.
+never reused. `PARK-E113` (a duplicate id, which could never fire) and
+`PARK-E219` are retired.
 
 | code | refusal |
 |---|---|
 | `PARK-E001` | usage: an unknown verb, flag or combination |
-| `PARK-E101` | `briefs/` does not exist at or above the working directory |
+| `PARK-E101` | `briefs/` does not exist at or above the working directory, or that directory itself is gone |
 | `PARK-E102` | a brief cannot be read as UTF-8 text |
 | `PARK-E103` | a brief has no frontmatter (its first line is not `---`) |
 | `PARK-E104` | a brief's frontmatter is never closed with `---` |
@@ -246,7 +301,6 @@ never reused.
 | `PARK-E110` | a list field that is not a list |
 | `PARK-E111` | a required field is missing |
 | `PARK-E112` | the id does not match the filename stem |
-| `PARK-E113` | a duplicate id |
 | `PARK-E114` | `briefs/` cannot be listed |
 | `PARK-E120` | `type` outside its vocabulary |
 | `PARK-E121` | `status` outside its vocabulary |
@@ -255,15 +309,19 @@ never reused.
 | `PARK-E124` | a watch whose status is not open |
 | `PARK-E125` | a watch without a trigger |
 | `PARK-E126` | a provenance line whose `github:` origin is not `github:[HOST/]OWNER/NAME#N` |
+| `PARK-E127` | a `brief` line or gate carrying the index's end marker |
+| `PARK-E128` | an id holding a character other than a letter, digit, `.`, `_` or `-`, which the index's link to it cannot carry |
 | `PARK-E130` | a `manual:` gate carrying no checkable fact |
 | `PARK-E131` | a gate that references its own brief |
 | `PARK-E132` | a gate that resolves to no brief |
 | `PARK-E133` | parked, but every gate has closed: the gate has opened |
 | `PARK-E134` | one deferral id claimed by more than one brief |
+| `PARK-E135` | live briefs whose gates wait on each other in a cycle |
 | `PARK-E140` | `TODO.md` carries no generated region (`map --check`) |
 | `PARK-E141` | `TODO.md` is stale against the briefs (`map --check`) |
 | `PARK-E142` | `TODO.md` cannot be read as UTF-8 text |
 | `PARK-E143` | `TODO.md` cannot be written (`map`) |
+| `PARK-E144` | `TODO.md` carries more than one end marker, so what is generated cannot be told from what is yours |
 | `PARK-E201` | a deposit id that is not a lowercase kebab slug |
 | `PARK-E202` | no such deposit in `briefs/inbox/` (the queue's README, in any spelling, is none) |
 | `PARK-E203` | the deposit already exists (deposits are create-only) |
@@ -277,12 +335,11 @@ never reused.
 | `PARK-E211` | a scaffolded value is blank, multi-line, padded, or does not read back as itself |
 | `PARK-E212` | a rejection reason that is blank or not one line |
 | `PARK-E213` | that GitHub origin is already deposited or promoted |
-| `PARK-E214` | a write failed; every file was restored |
+| `PARK-E214` | a write failed; every file was restored, or the ones that could not be are named |
 | `PARK-E215` | promotion refused: the tree would not validate |
 | `PARK-E216` | a deposit id reserved for the queue's README, in any letter case |
 | `PARK-E217` | an intake input cannot be read: the `--file` or stdin text, a deposit, or the `briefs/inbox/` listing |
-| `PARK-E218` | a `github#N` origin, the 0.4.0 form, names no repository: bind it first (`intake github --bind`) |
-| `PARK-E219` | `--bind` cannot prove a `github#N` origin's repository: no issue URL and no `--repo`, a URL naming another number, or two origins binding to one issue |
+| `PARK-E218` | a `github#N` origin, the 0.4.0 form, names no repository: write it as `github:OWNER/NAME#N` |
 | `PARK-E301` | `gh` is not on PATH |
 | `PARK-E302` | `gh` failed or timed out |
 | `PARK-E303` | `gh` answered something other than the expected JSON |
@@ -295,12 +352,6 @@ Two paths, no package index. Requires Python 3.15. Either way, park finds
 the repository from where you RUN it — the nearest directory at or above
 your working directory carrying `briefs/` — never from where it is
 installed, so both paths work from anywhere inside the repository.
-
-Until 3.15.0 final ships, provision the interpreter first: `uv python
-install 3.15` installs the release candidate, which both paths then use.
-Without it, `uvx` finds no interpreter for `>=3.15,<3.16` (a release
-candidate is not offered for that range), and a copy has no `python3.15`
-to run under.
 
 It is one file with no dependencies: copy `bin/park` from this repository to
 `bin/park` in yours — or anywhere on your `PATH` — and make it executable.
@@ -329,8 +380,11 @@ and retires the old mechanism deliberately rather than leaving two live:
 ## Conventions, and their limits
 
 Stated plainly rather than implied: `park` reads `briefs/*.md` at the
-repository root and writes the index into `TODO.md`, between a generated-region
-marker and the end of the file. Those paths are convention, not configuration —
+repository root, except a name that opens with a dot (macOS writes `._<name>`
+beside a file on some volumes), and writes the index into `TODO.md`, from the
+top of the file to its end marker. Anything below the marker is kept; anything above it is
+overwritten. A second marker in the file is refused (`PARK-E144`) and the file
+left as it is. Those paths are convention, not configuration —
 there are no flags to move them yet, and the brief tree is flat, so a
 repository that needs scoped subfolders or a differently-named index needs a
 change here first. The one subfolder park reads is `briefs/inbox/`, the

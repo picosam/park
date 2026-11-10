@@ -4,6 +4,71 @@ The version is a human judgment, bumped deliberately inside the change that
 will be published — it is never derived mechanically from commit types — and
 `--version` must discriminate any two published trees. Newest first.
 
+## 0.4.4
+
+**Run `park map` once after upgrading.** The index's preamble is shorter, its
+headings read `Open` and `Watches`, and a gate that has closed is no longer
+printed, so `park map --check` says `PARK-E141` until you do.
+
+**Run `park validate` too: a brief may need an edit.** It now refuses an id
+holding anything but letters, digits, `.`, `_` and `-` (`PARK-E128`), an
+indented key (`PARK-E105`) and an empty list item, `[,]` or a dash alone
+(`PARK-E109`). Each used to pass.
+
+**`--bind` is gone, and the GitHub code is frozen.** It keeps working and takes
+no new features. A `github#N` origin is edited by hand to `github:OWNER/NAME#N`,
+as its `PARK-E218` says. `PARK-E219` went with `--bind` and is never reused.
+One known flaw stays with the frozen code: the import reads a brief whose
+status is quoted (`status: "done"`) as still live, so it reads that brief's
+issue from the forge where it need not.
+
+**Fixed:**
+
+- `intake list` runs `promote`'s checks of each deposit and validates the tree
+  with it added. It showed as normal deposits that `promote` refused with
+  `PARK-E204`, `PARK-E201` or `PARK-E211`. It reads no `TODO.md`, so what
+  `promote` refuses there (`PARK-E142`, `PARK-E144`) shows at `promote` alone.
+- `intake list` names each other file waiting in `briefs/inbox/` as not a
+  deposit. A `finding.txt` or `bar.MD` was listed by nothing, and `reject`
+  refused it.
+- `promote` and `deposit` hold SIGINT, SIGTERM and SIGHUP while they write, so
+  an interrupt lands once the files are whole. An interrupted `promote` left
+  the brief and its deposit both. A SIGINT now ends any verb with one line,
+  `park: interrupted`, instead of a traceback.
+- A deposit's lines split at a newline only. A form feed, NEL or U+2028 was
+  turned into a line break when promoted, and cut a map line short; the body
+  now keeps it, and a map line holding one is refused (`PARK-E211`).
+- A quoted list item may hold a comma: `["a, b", c]` is two items, not three.
+- A value is unquoted only when one pair of quotes wraps it: `"Alpha" and
+  "Beta"` read as `Alpha" and "Beta`.
+- A brief that lists one deferral twice claims it once. It was reported as
+  claimed by two briefs.
+- A name that opens with a dot is no brief. One `._a.md`, which macOS writes on
+  some volumes, refused the whole tree.
+- A deleted working directory is refused (`PARK-E101`), and `--version` still
+  answers; each tracebacked.
+- `PARK-E113`, a duplicate id, could never fire, since an id is its file's stem.
+  It is retired and never reused.
+- `TODO.md` is replaced whole, so a reader never gets part of it, and `map` and
+  `promote` lock `briefs/`, so concurrent promotes lose no index line.
+- The index's end marker in a `brief` line or gate is refused (`PARK-E127`), and
+  in an id by the id rule (`PARK-E128`). It used to make every `map` grow the
+  file. A file that already holds a second
+  marker is refused unchanged (`PARK-E144`), because a marker you quoted below
+  the region looks the same as that damage: keep the right one by hand.
+- One GitHub issue is admitted once when a deposit, an import and a
+  promotion overlap: each holds a reservation on the origin from its check to
+  its write, where two could both pass the duplicate check.
+- `deposit` and the GitHub import refuse outside a tree (`PARK-E101`) instead of
+  making `briefs/inbox/`.
+- Gates that wait on each other in a cycle are refused (`PARK-E135`).
+- The README's example validates when pasted, and it no longer calls the
+  frontmatter a subset of YAML.
+
+**The GitHub import** leaves an open issue with a comment on the forge unless you
+pass `--with-commented`, and names each deposit or live brief whose issue is no
+longer open, at one forge read for each origin the list left out.
+
 ## 0.4.3
 
 **Two repositories' issues of one number and title both import.** 0.4.1

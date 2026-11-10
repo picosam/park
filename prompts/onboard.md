@@ -10,24 +10,17 @@ decision the migration surfaced put to a human rather than taken.
 
 ---
 
-## The discipline this needs
+## Two ways this goes wrong
 
-Two failure modes are worth naming before you start, because both are common
-and neither announces itself:
+- **Migrating onto a validator nothing runs.** An unchecked brief tree drifts
+  like the backlog it replaced, so wire `park map --check` into CI in the change
+  that lands the first briefs.
+- **Leaving two parking systems live.** Readers cannot tell which one holds, so
+  they consult neither. If you cannot finish retiring the old one, do not begin.
 
-1. **Migrating onto a validator this repository does not run.** An unchecked
-   brief tree drifts exactly like the backlog it replaced. Wire `park map
-   --check` into CI in the same change that lands the first briefs, or do not
-   start.
-2. **Leaving two parking systems live.** Half-migrations are worse than no
-   migration: readers cannot tell which system is authoritative, so they
-   consult neither. Retiring the old mechanism is part of this job, not a
-   follow-up. If you cannot finish the retirement, do not begin the migration.
-
-Nothing in this prompt authorizes you to decide anything the repository's
-owners have not decided. Migration is **filing, not deciding** — a buried
-decision becomes a brief that puts the question in front of a human, still
-open. In particular, never mark anything `superseded`: that is a ruling.
+Migration is filing, not deciding. A buried decision becomes a brief that puts
+the question to a human, still open. Never mark anything `superseded`: that is a
+ruling.
 
 ## §1 — Inventory what this repository parks. Change nothing.
 
@@ -40,8 +33,7 @@ For each: an id, what it is, its state, what it is blocked on, and where it
 lives now. Write it to a scratch file — the register is evidence for the
 mapping, not a deliverable.
 
-Look for these two deliberately, because they are what the format exists to
-catch and they never surface on their own:
+Two kinds never surface on their own, so look for them:
 
 - **Items parked inside other items.** A live decision inside an entry marked
   done; a real task as a sub-bullet of an unrelated one. These are invisible to
@@ -121,18 +113,10 @@ whole point; what is forbidden is drift.
 
 ## §5 — Make this repository's agent instructions true again
 
-An agent instruction file — `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, a rules
-file, whatever the agents working here load — is read into **every** session.
-That makes a wrong one worse than none at all: an agent acts on it without
-checking, and the error repeats silently in every session until a human
-happens to notice.
-
-The migration you just ran has very probably made one false. This is not
-hypothetical: in the repository where this format was built, the instruction
-file called the old backlog file "the backlog's source of truth", and that
-sentence was false the moment the migration finished. It was caught because
-somebody went looking, which is not a mechanism — which is why this step is
-written down.
+An agent instruction file (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, a rules file)
+is read into every session, so a wrong one repeats its error silently. The
+migration has very probably made one false: a line calling the old file "the
+backlog's source of truth", say.
 
 **Required — repair what this migration changed.** In every instruction file
 an agent here loads, make these true:
@@ -184,9 +168,8 @@ one; where it already states a branch and push rule, make that rule true
 rather than adding the commit line beside it. The same holds when the
 repository carried its instruction file before either tool.
 
-**Offered, and bounded — the optimization pass.** While you are in these
-files, *propose* improvements against these criteria — the ones that make an
-instruction file cheap to load and hard to get wrong:
+**Offered, and bounded.** While you are in these files, propose improvements
+that make an instruction file cheap to load and hard to get wrong:
 
 - **Routing over restating.** Its job is to say where things are and what
   binds behaviour, not to re-explain what a checked artefact already holds.
@@ -202,21 +185,15 @@ instruction file cheap to load and hard to get wrong:
   reads as a safety net and is not one. Verify each such claim against live
   configuration before letting it stand.
 
-**Anti-goals, and they matter.** This is not a licence to rewrite the
-repository's agent contract wholesale, to import conventions from elsewhere,
-or to impose a house style. Every change must trace to something the migration
-made false, or to one of the criteria above. Propose a diff, cite what makes
-each change true, and get the owner's agreement before applying it — a
-repository's instruction file encodes decisions you were not present for.
+Do not rewrite the repository's agent contract wholesale, or import conventions
+or a house style. Trace each change to something the migration made false or to
+a criterion above, propose it as a diff, and get the owner's agreement first: an
+instruction file encodes decisions you were not present for.
 
 ## §6 — When the old format holds what the new one cannot express
 
-This is the case that decides whether this schema is adequate for your
-repository or merely adequate somewhere else. The rule: **never squash the
-inexpressible into the nearest field.**
-
-Stop, and write the case up concretely — the item, the field, exactly what
-would be lost. Then choose, with a human:
+Never squash the inexpressible into the nearest field. Write the case up (the
+item, the field, what would be lost), then choose with a human:
 
 1. **Extend the schema.** File it upstream as an issue; a field that several
    repositories need is a real gap, and the maintainer would rather hear it

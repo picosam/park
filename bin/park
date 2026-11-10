@@ -6,7 +6,8 @@
                                  generated region in place
     bin/park map --check         validate and compare; non-zero when the
                                  region on disk disagrees with the briefs
-    bin/park intake list         every deposit in briefs/inbox/
+    bin/park intake list         every deposit in briefs/inbox/, and each
+                                 file there that is not one
     bin/park intake deposit ID   create briefs/inbox/ID.md from stdin
                                  (or --file); create-only
     bin/park intake promote ID   deposit -> briefs/ID.md, map regenerated,
@@ -17,9 +18,11 @@
     bin/park intake github --outbound --repo R [--apply]
                                  plan (or, with --apply, make) the closes
                                  of R's issues whose brief is done
-    bin/park intake github --bind [--repo R] [--apply]
-                                 plan (or make) the binding of the 0.4.0
-                                 `github#N` origins to their repository
+
+The GitHub code is frozen (Osama, 2026-11-04): it keeps working and takes no new
+features. One known flaw stays with it: `github_records` reads a quoted
+`status: "done"` as unsettled, so the import reads that brief's issue from the
+forge where it need not.
 
 Exit 0 clean; 1 on a refusal (validation, drift, intake, a failed write); 2
 on usage. Every refusal line opens with a stable code, `PARK-Ennn` — CODES
@@ -30,7 +33,7 @@ directory that carries `briefs/` — resolved from where park is RUN, never
 from where it is installed, so a copy on PATH or a `uvx` install works on
 whatever repository you are standing in.
 
-The schema: YAML frontmatter carrying exactly the fields id / type /
+The schema: frontmatter carrying exactly the fields id / type /
 status / owner / gate / triggers / deferrals / brief, with closed
 vocabularies, and gates expressed as brief ids rather than prose (the one
 prose form is "manual: <checkable fact>", which is unresolvable by design
@@ -38,11 +41,11 @@ and treated as such). `deferrals` names, as a list of ids, any prior
 decision this brief is the live destination for — the durable, structural
 answer to "where did that deferred item go" that used to be answered by
 scanning prose for a checkbox next to the id (brief
-deferral-guard-resolves-structurally). The parser accepts precisely that
-subset — plain scalars, inline `[a, b]` lists, block `- item` lists — and
-refuses anything else naming the offending field. There is deliberately no
-YAML library: standard library only, so the tool is one file with no
-dependencies.
+deferral-guard-resolves-structurally). The parser accepts precisely this
+grammar — plain scalars, inline `[a, b]` lists, block `- item` lists — and
+refuses anything else naming the offending field. It is not YAML: a value may
+hold a second colon, which a YAML parser refuses. Standard library only, so
+the tool is one file with no dependencies.
 
 Two semantic checks follow from treating blockers and destinations as ids
 rather than prose. First, the reason gates are ids: a `parked` brief whose
@@ -64,16 +67,27 @@ Once nothing is left below the marker, the whole file is generated.
 """
 
 import argparse
+import contextlib
 import datetime
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
+import tempfile
+import unicodedata
 from pathlib import Path
 from typing import NamedTuple
+
+try:
+    import fcntl
+except ImportError:     # Windows: no lock; writes stay atomic
+    fcntl = None
 
 # Declared from the first commit rather than added at publication: the sibling
 # review tool shipped two releases whose `--version` could not tell them apart,
@@ -84,7 +98,7 @@ from typing import NamedTuple
 # deliberately inside the change that will be published — never derived
 # mechanically from commit types — and --version must discriminate any two
 # published trees.
-PARK_VERSION = "0.4.3"
+PARK_VERSION = "0.4.4"
 
 def find_root() -> Path:
     """The nearest ancestor (working directory upward) carrying `briefs/`.
@@ -92,9 +106,16 @@ def find_root() -> Path:
     Resolved from the working directory, not the script's location: a park
     installed on PATH or run through `uvx` sits nowhere near the repository
     it is asked about. Falls back to the working directory itself, so the
-    missing-briefs refusal names the place park actually looked.
+    missing-briefs refusal names the place park actually looked. When the
+    working directory itself is gone (deleted under the shell), the answer
+    is the relative `Path()`, which `main` refuses (E101) before any verb
+    reads it, so `--version` still answers (the 2026-11-04 review: every
+    verb, `--version` included, tracebacked here).
     """
-    cwd = Path.cwd().resolve()
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        return Path()
     for candidate in (cwd, *cwd.parents):
         if (candidate / "briefs").is_dir():
             return candidate
@@ -126,7 +147,8 @@ INBOX = BRIEFS / "inbox"
 # carries the same table, held to this one by a test.
 CODES = {
     "PARK-E001": "usage: an unknown verb, flag or combination",
-    "PARK-E101": "`briefs/` does not exist at or above the working directory",
+    "PARK-E101": "`briefs/` does not exist at or above the working directory, "
+                 "or that directory itself is gone",
     "PARK-E102": "a brief cannot be read as UTF-8 text",
     "PARK-E103": "a brief has no frontmatter (its first line is not `---`)",
     "PARK-E104": "a brief's frontmatter is never closed with `---`",
@@ -138,7 +160,8 @@ CODES = {
     "PARK-E110": "a list field that is not a list",
     "PARK-E111": "a required field is missing",
     "PARK-E112": "the id does not match the filename stem",
-    "PARK-E113": "a duplicate id",
+    # PARK-E113, a duplicate id, could never fire: an id is its file's stem,
+    # and no two files share one. It went in 0.4.4 and is never reused.
     "PARK-E114": "`briefs/` cannot be listed",
     "PARK-E120": "`type` outside its vocabulary",
     "PARK-E121": "`status` outside its vocabulary",
@@ -148,15 +171,21 @@ CODES = {
     "PARK-E125": "a watch without a trigger",
     "PARK-E126": "a provenance line whose `github:` origin is not "
                  "`github:[HOST/]OWNER/NAME#N`",
+    "PARK-E127": "a `brief` line or gate carrying the index's end marker",
+    "PARK-E128": "an id holding a character other than a letter, digit, `.`, "
+                 "`_` or `-`, which the index's link to it cannot carry",
     "PARK-E130": "a `manual:` gate carrying no checkable fact",
     "PARK-E131": "a gate that references its own brief",
     "PARK-E132": "a gate that resolves to no brief",
     "PARK-E133": "parked, but every gate has closed: the gate has opened",
     "PARK-E134": "one deferral id claimed by more than one brief",
+    "PARK-E135": "live briefs whose gates wait on each other in a cycle",
     "PARK-E140": "`TODO.md` carries no generated region (`map --check`)",
     "PARK-E141": "`TODO.md` is stale against the briefs (`map --check`)",
     "PARK-E142": "`TODO.md` cannot be read as UTF-8 text",
     "PARK-E143": "`TODO.md` cannot be written (`map`)",
+    "PARK-E144": "`TODO.md` carries more than one end marker, so what is "
+                 "generated cannot be told from what is yours",
     "PARK-E201": "a deposit id that is not a lowercase kebab slug",
     "PARK-E202": "no such deposit in `briefs/inbox/` (the queue's README, "
                  "in any spelling, is none)",
@@ -172,17 +201,16 @@ CODES = {
                  "not read back as itself",
     "PARK-E212": "a rejection reason that is blank or not one line",
     "PARK-E213": "that GitHub origin is already deposited or promoted",
-    "PARK-E214": "a write failed; every file was restored",
+    "PARK-E214": "a write failed; every file was restored, or the ones "
+                 "that could not be are named",
     "PARK-E215": "promotion refused: the tree would not validate",
     "PARK-E216": "a deposit id reserved for the queue's README, in any "
                  "letter case",
     "PARK-E217": "an intake input cannot be read: the `--file` or stdin "
                  "text, a deposit, or the `briefs/inbox/` listing",
-    "PARK-E218": "a `github#N` origin, the 0.4.0 form, names no "
-                 "repository: bind it first (`intake github --bind`)",
-    "PARK-E219": "`--bind` cannot prove a `github#N` origin's repository: "
-                 "no issue URL and no `--repo`, a URL naming another "
-                 "number, or two origins binding to one issue",
+    "PARK-E218": "a `github#N` origin, the 0.4.0 form, names no repository: "
+                 "write it as `github:OWNER/NAME#N`",
+    # PARK-E219 went with `--bind` in 0.4.4 and is never reused.
     "PARK-E301": "`gh` is not on PATH",
     "PARK-E302": "`gh` failed or timed out",
     "PARK-E303": "`gh` answered something other than the expected JSON",
@@ -193,6 +221,93 @@ CODES = {
 }
 
 
+def write_atomic(path: Path, data: bytes) -> None:
+    """Replace `path` whole: a reader gets the old bytes or the new ones. A
+    file the user may not write stays refused, as opening it would be."""
+    target = Path(os.path.realpath(path))
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not os.access(target, os.W_OK):
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES),
+                              str(path))
+    if mode is None:
+        mask = os.umask(0)
+        os.umask(mask)
+        mode = 0o666 & ~mask
+    fd, scratch = tempfile.mkstemp(prefix=f".{target.name}.",
+                                   dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(scratch, mode)
+        os.replace(scratch, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(scratch)
+        raise
+
+
+@contextlib.contextmanager
+def tree_lock(shared: bool = False):
+    """Hold `briefs/` itself, not a lock file, so nothing appears in the tree
+    and a killed holder releases it. Where it cannot be held (no flock, or
+    `briefs/` cannot be opened, which the verb then refuses itself) the verb
+    runs unlocked."""
+    fd = None
+    with contextlib.suppress(OSError):
+        fd = os.open(BRIEFS, os.O_RDONLY)
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+#: What `uninterrupted` holds: the signals that end a run by default.
+INTERRUPTS = tuple(getattr(signal, name) for name in
+                   ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, name))
+
+
+@contextlib.contextmanager
+def uninterrupted():
+    """Hold SIGINT, SIGTERM and SIGHUP while a write sequence runs, so one
+    that arrives lands once the sequence is whole, never between its files
+    (the 2026-11-04 review: an interrupted promote left the brief and its
+    deposit both, and promoting again refused E204). Released, a held SIGINT
+    raises KeyboardInterrupt and a held SIGTERM or SIGHUP ends the process,
+    as either would have. When the sequence raises instead, a refusal among
+    them, nothing is released: the refusal is said, and the run ends with
+    it. SIGKILL and a crash cannot be held, and where no signal can be (no
+    `pthread_sigmask`: Windows), none is."""
+    mask = getattr(signal, "pthread_sigmask", None)
+    if mask is None:
+        yield
+        return
+    mask(signal.SIG_BLOCK, INTERRUPTS)
+    yield
+    mask(signal.SIG_UNBLOCK, INTERRUPTS)
+
+
+def interrupted() -> int:
+    """After a SIGINT: one line where a traceback stood, then the end Python
+    gives an unhandled KeyboardInterrupt, by SIGINT, so a calling shell
+    stops as it would have. Where that end cannot be given, exit 130."""
+    print("park: interrupted", file=sys.stderr)
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(OSError, ValueError):
+            stream.flush()
+    if os.name == "posix":
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+    return 130
+
+
 def refusal(code: str, text: str) -> str:
     """One refusal line: its stable code, then the prose."""
     if code not in CODES:
@@ -201,10 +316,34 @@ def refusal(code: str, text: str) -> str:
 
 
 def _unquote(value: str) -> str:
-    """Strip one pair of matching surrounding quotes, if present."""
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+    """Strip one pair of surrounding quotes: a value that opens with `"` or
+    `'` and holds no other quote of that kind until its last character,
+    which closes it. `"Alpha" and "Beta"` opens and ends with a quote but is
+    no pair, so it reads as written (the 2026-11-04 review: it read as
+    `Alpha" and "Beta`)."""
+    if (len(value) >= 2 and value[0] in "'\"" and value[-1] == value[0]
+            and value[0] not in value[1:-1]):
         return value[1:-1]
     return value
+
+
+#: One item of an inline list and what ends it: a quoted item (`_unquote`'s
+#: pair) may hold a comma, a plain one runs to the next comma.
+INLINE_ITEM = re.compile(r"""\s*("[^"]*"|'[^']*'|[^,]*?)\s*(?:(,)|\Z)""")
+
+
+def inline_items(inner: str) -> list[str]:
+    """The items between an inline list's brackets, each unquoted. A comma
+    inside a quoted item does not split it (the 2026-11-04 review:
+    `["a, b", c]` read as three items); an empty item stays in the list as
+    `""`, for the caller to refuse."""
+    items, at = [], 0
+    while True:
+        m = INLINE_ITEM.match(inner, at)
+        items.append(_unquote(m.group(1)))
+        if m.group(2) is None:
+            return items
+        at = m.end()
 
 
 def parse_front(path: Path, errors: list[str]) -> dict | None:
@@ -239,12 +378,14 @@ def parse_text(rel, text: str, errors: list[str]) -> dict | None:
             body = "\n".join(lines[n:]).strip()
             data["_body"] = body
             break
-        if line.startswith("  - ") or line.startswith("- "):
+        # A dash alone is an item too, an empty one (E109): it used to fall
+        # through to E105 (the 2026-11-04 review).
+        if line in ("-", "  -") or line.startswith(("- ", "  - ")):
             if pending_list is None:
                 errors.append(refusal("PARK-E108", f"{rel}:{n}: list item "
                                                    f"outside a list field"))
                 return None
-            item = _unquote(line.split("- ", 1)[1].strip())
+            item = _unquote(line.lstrip()[1:].strip())
             if not item:
                 errors.append(refusal("PARK-E109",
                                       f"{rel}:{n}: empty list item"))
@@ -255,11 +396,15 @@ def parse_text(rel, text: str, errors: list[str]) -> dict | None:
             continue
         pending_list = None
         key, sep, value = line.partition(":")
-        key = key.strip()
+        # A key opens its line: this grammar nests nothing, so an indented
+        # key is refused rather than read as if it were not indented (the
+        # 2026-11-04 review: this check stood after the strip, and never
+        # fired).
         if not sep or key != key.lstrip():
             errors.append(refusal("PARK-E105", f"{rel}:{n}: not a "
                                                f"`key: value` line: {line!r}"))
             return None
+        key = key.strip()
         if key not in FIELDS:
             errors.append(refusal("PARK-E106", f"{rel}:{n}: unknown field "
                                   f"{key!r} (schema fields: "
@@ -278,9 +423,13 @@ def parse_text(rel, text: str, errors: list[str]) -> dict | None:
                 data[key] = []
             elif value.startswith("[") and value.endswith("]"):
                 inner = value[1:-1].strip()
-                data[key] = ([] if not inner
-                             else [_unquote(v.strip())
-                                   for v in inner.split(",")])
+                data[key] = inline_items(inner) if inner else []
+                # `[,]` read as two empty items, and a watch took them as
+                # its triggers (the 2026-11-04 review).
+                if "" in data[key]:
+                    errors.append(refusal("PARK-E109", f"{rel}:{n}: empty "
+                                                       f"list item in {key}"))
+                    return None
             else:
                 errors.append(refusal("PARK-E110", f"{rel}:{n}: {key} must "
                                       f"be a list ([] / [a, b] / block "
@@ -334,6 +483,11 @@ def load_briefs(errors: list[str]) -> dict[str, dict]:
     # proposals and must never enter the index. A recursive glob would index
     # every deposit the day it landed.
     for path in sorted(BRIEFS.glob("*.md")):
+        # A name opening with a dot is no brief: macOS writes `._<name>`
+        # beside a file on some volumes, and one of those refused the whole
+        # tree with E103 (the 2026-11-04 review).
+        if path.name.startswith("."):
+            continue
         rel = path.relative_to(ROOT)
         data = parse_front(path, errors)
         if data is None:
@@ -343,10 +497,6 @@ def load_briefs(errors: list[str]) -> dict[str, dict]:
             errors.append(refusal("PARK-E112", f"{rel}: id {bid!r} does not "
                                   f"match filename stem {path.stem!r} (one "
                                   f"brief, one file, one id)"))
-            continue
-        if bid in briefs:
-            errors.append(refusal("PARK-E113",
-                                  f"{rel}: duplicate id {bid!r}"))
             continue
         data["_path"] = rel
         briefs[bid] = data
@@ -377,6 +527,21 @@ def validate(briefs: dict[str, dict], errors: list[str]) -> None:
             if not b["triggers"]:
                 errors.append(refusal("PARK-E125", f"{rel}: a watch needs at "
                                                    f"least one trigger"))
+        # The index is split at this marker, so one rendered from a brief
+        # would turn the lines after it into a preserved tail on every `map`.
+        # An id cannot hold it: the rule below refuses its spaces.
+        if any(END_MARK in v for v in (b["brief"], *b["gate"])):
+            errors.append(refusal("PARK-E127", f"{rel}: carries the index's "
+                                  f"end marker {END_MARK!r}"))
+        # The index links each id as `briefs/<id>.md`, so an id holds only
+        # what that link carries (the 2026-11-04 review: `id: "Foo Bar"`
+        # validated and mapped to a broken link).
+        odd = next((c for c in bid if c not in "._-"
+                    and unicodedata.category(c)[0] not in "LNM"), None)
+        if odd is not None:
+            errors.append(refusal("PARK-E128", f"{rel}: id {bid!r} holds "
+                                  f"{odd!r}; an id is letters, digits, `.`, "
+                                  f"`_` and `-`"))
         # A `github:` origin is what outbound closes by and inbound
         # deduplicates on; one that does not parse would silently do
         # neither, so it is refused here rather than ignored there.
@@ -423,7 +588,9 @@ def validate(briefs: dict[str, dict], errors: list[str]) -> None:
     # defect is between briefs rather than inside any single one.
     claimed_by: dict[str, list[str]] = {}
     for bid, b in sorted(briefs.items()):
-        for d in b["deferrals"]:
+        # A brief that lists an id twice still claims it once (the
+        # 2026-11-04 review: `[x, x]` read as two briefs, "d, d").
+        for d in dict.fromkeys(b["deferrals"]):
             claimed_by.setdefault(d, []).append(bid)
     for d, owners in sorted(claimed_by.items()):
         if len(owners) > 1:
@@ -432,14 +599,49 @@ def validate(briefs: dict[str, dict], errors: list[str]) -> None:
                 f"deferral {d!r} is claimed by more than one brief's "
                 f"deferrals: {', '.join(owners)} — a destination must "
                 f"resolve to exactly one brief"))
+    gate_cycles(briefs, errors)
+
+
+def gate_cycles(briefs: dict[str, dict], errors: list[str]) -> None:
+    """A cycle among live briefs can never open: each waits on the other.
+    A closed brief blocks nothing, so it breaks one."""
+    live = ("open", "parked")
+    waits = {bid: [g for g in b["gate"] if g != bid and g in briefs
+                   and briefs[g]["status"] in live]
+             for bid, b in briefs.items() if b["status"] in live}
+    seen: set[str] = set()
+    for start in sorted(waits):
+        if start in seen:
+            continue
+        # An explicit stack: a chain of gates may be deeper than Python's.
+        seen.add(start)
+        path, on_path, stack = [start], {start}, [iter(waits[start])]
+        while stack:
+            for g in stack[-1]:
+                if g in on_path:
+                    loop = path[path.index(g):] + [g]
+                    errors.append(refusal(
+                        "PARK-E135", f"{briefs[g]['_path']}: gates wait in a "
+                                     f"cycle: {' -> '.join(loop)}"))
+                elif g not in seen:
+                    seen.add(g)
+                    path.append(g)
+                    on_path.add(g)
+                    stack.append(iter(waits[g]))
+                    break
+            else:
+                stack.pop()
+                on_path.discard(path.pop())
 
 
 def render_map(briefs: dict[str, dict]) -> str:
     def line(b: dict, with_gate: bool) -> str:
         head = (f"- [`{b['id']}`](briefs/{b['id']}.md) "
                 f"({b['type']}, {b['owner']})")
-        if with_gate and b["gate"]:
-            head += f" gate: {', '.join(b['gate'])}"
+        waiting = [g for g in b["gate"] if g.startswith("manual:")
+                   or briefs[g]["status"] not in ("done", "superseded")]
+        if with_gate and waiting:
+            head += f" gate: {', '.join(waiting)}"
         return f"{head} — {b['brief']}"
 
     open_items = [b for b in briefs.values()
@@ -452,22 +654,16 @@ def render_map(briefs: dict[str, dict]) -> str:
     for group in (open_items, watches, parked):
         group.sort(key=lambda b: b["id"])
 
-    out = ["# TODO — brief index", ""]
-    out += [
-        "<!-- GENERATED by park from briefs/*.md — do not edit this region",
-        "     by hand; edit the briefs and run `park map`. `park map",
-        "     --check` guards it. -->",
+    out = [
+        "# TODO — brief index",
         "",
-        "The backlog lives in `briefs/` — one topic per file, frontmatter",
-        "`id/type/status/owner/gate/triggers/brief`. This index is for",
-        "ROUTING: read ONE brief on demand, never the whole tree.",
+        "<!-- GENERATED by park from briefs/*.md: edit a brief, then run "
+        "`park map`. -->",
         "",
-        "This map is ACTIVE-ONLY. Closed briefs stay validated, linkable and",
-        "gate-resolvable; they are not rendered here, because this file is",
-        "for choosing the next piece of work. To reach them:",
-        "",
-        "    rg -l '^status: (done|superseded)$' briefs   # list them",
-        "    rg <term> briefs                             # search all bodies",
+        "Choose the next piece of work here, then read that one brief. Closed "
+        "briefs stay in",
+        "`briefs/`: `rg -l '^status: (done|superseded)$' briefs`, or "
+        "`rg <term> briefs`.",
         "",
     ]
     # Named only where it exists: the archive is this repository's choice,
@@ -479,8 +675,8 @@ def render_map(briefs: dict[str, dict]) -> str:
         out += [f"The closed record is `{archive.name}` — grep it, do not "
                 f"load it per-session.", ""]
     sections = [
-        ("Open — actionable now", open_items, True),
-        ("Watches — armed triggers", watches, False),
+        ("Open", open_items, True),
+        ("Watches", watches, False),
         ("Parked — waiting on a gate", parked, True),
     ]
     for title, group, with_gate in sections:
@@ -512,6 +708,13 @@ def compose_map(briefs: dict[str, dict]) -> tuple[str, str, str | None]:
     except (OSError, UnicodeDecodeError) as exc:
         raise Refused(refusal("PARK-E142", f"{TODO.name}: unreadable "
                                            f"({exc})")) from None
+    # A second marker may be old damage or text someone quoted, and nothing
+    # tells them apart, so nothing here rewrites the file.
+    if current.count(END_MARK) > 1:
+        raise Refused(refusal("PARK-E144", f"{TODO.name} carries "
+                              f"{current.count(END_MARK)} of {END_MARK!r}: "
+                              f"keep the one that ends the generated region, "
+                              f"by hand; it is unchanged"))
     head, tail = split_todo(current)
     return current, rendered + ("\n" + tail if tail else ""), head
 
@@ -533,11 +736,10 @@ def compose_map(briefs: dict[str, dict]) -> tuple[str, str, str | None]:
 # two cannot be read as each other. The repository is part of the origin
 # because an issue number alone names nothing: `github#<N>`, the form 0.4.0
 # wrote, let a brief imported from one repository close the same number in
-# another. That form is still read, so it can be found and bound
-# (`intake github --bind`), and refused (PARK-E218) wherever park would
-# write it, deduplicate on it or close by it. A line 1 with no `, origin
-# ...` is the form written before 0.4.0: `promote` takes it with an
-# explicit `--origin`, and `deposit` refuses it. Deposits never enter the
+# another. That form is still read, so it is found and refused (PARK-E218)
+# wherever park would write it, deduplicate on it or close by it. A line 1
+# with no `, origin ...` is the form written before 0.4.0: `promote` takes it
+# with an explicit `--origin`, and `deposit` refuses it. Deposits never enter the
 # index: the loader globs `briefs/*.md` and nothing deeper.
 
 ORIGINS = ("analyst", "operator", "script", "review")
@@ -560,7 +762,7 @@ PROVENANCE = re.compile(
     r"(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})"
     r"(?:, origin (?P<origin>[a-z]+(?:[#:]\S*)?))?")
 QUEUE_README = "README.md"
-BIND_HINT = "bind it first: `park intake github --bind [--repo OWNER/NAME]`"
+EDIT_HINT = "edit it by hand to `github:OWNER/NAME#{n}`"
 
 
 class Refused(Exception):
@@ -603,7 +805,7 @@ class Repo:
 
 def origin_valid(origin: str) -> bool:
     """In the vocabulary, the 0.4.0 `github#N` included: it is READ, so it
-    can be named and bound; `need_bound` refuses writing or acting on it."""
+    can be named; `need_bound` refuses writing or acting on it."""
     return (origin in ORIGINS or BOUND_ORIGIN.fullmatch(origin) is not None
             or GITHUB_ORIGIN.fullmatch(origin) is not None)
 
@@ -631,7 +833,7 @@ def issue_url(text: str | None) -> tuple[Repo, int] | None:
 WRITE_HINT = "write `github:OWNER/NAME#{n}` instead"
 
 
-def need_bound(origin: str | None, where: str, hint: str = BIND_HINT) -> None:
+def need_bound(origin: str | None, where: str, hint: str = EDIT_HINT) -> None:
     """Refuse a 0.4.0 `github#N` origin where park would write or act on
     it; `hint` says what to do instead, `{n}` standing for its number."""
     n = legacy_number(origin)
@@ -701,6 +903,18 @@ def one_line(value: str) -> bool:
     return bool(value) and value.splitlines() == [value]
 
 
+def lines_of(text: str) -> list[str]:
+    """A deposit's lines, split at a newline only (CR LF and a lone CR read
+    as one, as text mode reads them). A form feed, NEL or U+2028 stays in
+    its line, so a promotion keeps the body as written, and a map line
+    holding one is refused (E211) where `splitlines` cut it there (the
+    2026-11-04 review: `first<U+2028>second` became `brief: first`)."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def deposit_path(did: str) -> Path:
     return INBOX / f"{did}.md"
 
@@ -761,7 +975,7 @@ def read_deposit(path: Path) -> list[str]:
         raise Refused(refusal("PARK-E217", f"{rel}: unreadable "
                               f"({exc.strerror or type(exc).__name__})")) \
             from None
-    lines = text.splitlines()
+    lines = lines_of(text)
     if not lines or not lines[0].strip():
         raise Refused(refusal("PARK-E205", f"{rel}: empty, or line 1 is "
                                            f"blank"))
@@ -779,12 +993,8 @@ def map_line(lines: list[str], where: str) -> str:
 class Record(NamedTuple):
     """One GitHub origin already recorded in the tree."""
     path: Path
-    kind: str               # "deposit" or "brief"
-    index: int              # its provenance line, as an index into the lines
     origin: str             # the origin as written
-    evidence: str | None    # the first non-blank line after the provenance
-                            # line (a deposit's map line skipped): where
-                            # 0.4.0's import wrote the issue's URL
+    settled: bool           # a brief whose status is done or superseded
 
     @property
     def rel(self) -> str:
@@ -806,14 +1016,10 @@ def github_records() -> list[Record]:
     hides the line it opens with."""
     found: list[Record] = []
 
-    def note(path: Path, kind: str, lines: list[str], index: int,
-             skip: int) -> None:
-        origin = leading_origin(lines[index])
-        if bound_origin(origin) is None and legacy_number(origin) is None:
-            return
-        rest = [l.strip() for l in lines[index + 1 + skip:] if l.strip()]
-        found.append(Record(path, kind, index, origin,
-                            rest[0] if rest else None))
+    def note(path: Path, line: str, settled: bool = False) -> None:
+        origin = leading_origin(line)
+        if bound_origin(origin) is not None or legacy_number(origin) is not None:
+            found.append(Record(path, origin, settled))
 
     for path in deposits():
         rel = path.relative_to(ROOT)
@@ -826,7 +1032,7 @@ def github_records() -> list[Record]:
                 from None
         lines = raw.decode("utf-8", "replace").splitlines()
         if lines:
-            note(path, "deposit", lines, 0, 1)
+            note(path, lines[0])
     if not BRIEFS.is_dir():
         return found
     why = unlistable(BRIEFS)
@@ -849,7 +1055,9 @@ def github_records() -> list[Record]:
         first = next((i for i in range(fences[1] + 1, len(lines))
                       if lines[i].strip()), None)
         if first is not None:
-            note(path, "brief", lines, first, 0)
+            status = next((l.split(":", 1)[1].strip() for l in lines[:fences[1]]
+                           if l.startswith("status:")), None)
+            note(path, lines[first], status in ("done", "superseded"))
     return found
 
 
@@ -872,7 +1080,7 @@ def unbound_conflict(legacy: dict[int, list[str]], repo: Repo,
                      n: int) -> str:
     return refusal("PARK-E218", f"{legacy[n][0]}: origin github#{n} names no "
                    f"repository, so it cannot say whether {repo.origin(n)} "
-                   f"is recorded already; {BIND_HINT}")
+                   f"is recorded already; {EDIT_HINT.format(n=n)}")
 
 
 def scaffold(bid: str, btype: str, triggers: list[str], line: str,
@@ -890,6 +1098,9 @@ def survives(bid: str, btype: str, triggers: list[str], line: str) -> None:
         if not one_line(value) or value != value.strip():
             raise Refused(refusal("PARK-E211", f"{value!r} is blank, "
                                   f"multi-line or padded"))
+    if END_MARK in line:
+        raise Refused(refusal("PARK-E127", f"{line!r} carries the index's "
+                              f"end marker"))
     errors: list[str] = []
     data = parse_text(f"briefs/{bid}.md",
                       scaffold(bid, btype, triggers, line, "x\n"), errors)
@@ -910,9 +1121,14 @@ def create_file(path: Path, text: str, made: list[Path]) -> None:
         handle.write(text)
 
 
-def rollback(made: list[Path], restore: dict) -> None:
+def rollback(made: list[Path], restore: dict) -> list[str]:
     """Undo, newest first: remove what was created, put back the bytes of
-    what was changed or removed (None: it did not exist before)."""
+    what was changed or removed (None: it did not exist before). Then READ
+    BACK every path and return, relative to the root, each one that is not
+    as it was: [] is the only answer that lets a caller say every file was
+    restored (2026-11-02: an undo that failed itself was silent, and the
+    refusal still said every file was restored). An undo is attempted for
+    each path whatever an earlier one did."""
     for path in reversed(made):
         try:
             path.unlink()
@@ -923,9 +1139,104 @@ def rollback(made: list[Path], restore: dict) -> None:
             if data is None:
                 path.unlink(missing_ok=True)
             else:
-                path.write_bytes(data)
+                write_atomic(path, data)
         except OSError:
             pass
+    want = {path: None for path in made if path not in restore}
+    want.update(restore)
+    uncertain = []
+    for path, data in want.items():
+        try:
+            now = (path.read_bytes() if path.is_file()
+                   else None if not os.path.lexists(path) else ...)
+        except OSError:
+            now = ...
+        if now != data:
+            uncertain.append(path)
+    return [shown(path) for path in uncertain]
+
+
+def shown(path: Path) -> str:
+    """A path as a refusal names it: relative to the root where it can be."""
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def undone(uncertain: list[str], clean: str) -> str:
+    """What a refusal says about its undo: `clean` only when `rollback`
+    read every path back as it was, else the paths it could not."""
+    if not uncertain:
+        return clean
+    return (f"the undo could not be confirmed for {', '.join(uncertain)}: "
+            f"each may be partly written, missing or left behind; check "
+            f"each by hand (`git status`, `git diff`) before running this "
+            f"again")
+
+
+def drop_new_inbox(new_dir: bool, uncertain: list[str]) -> list[str]:
+    """Remove the inbox a failed write created, and say so if it stays."""
+    if new_dir:
+        try:
+            INBOX.rmdir()
+        except OSError:
+            pass
+        if os.path.lexists(INBOX):
+            uncertain = [*uncertain, shown(INBOX) + "/"]
+    return uncertain
+
+
+def deposit_checks(did: str, path: Path) -> tuple[list[str], re.Match, str]:
+    """What `promote` refuses of a deposit whatever its flags. `list` asks
+    the same and validates the tree with the deposit added, as promote
+    does, and no more: it reads no `TODO.md`, so what promote refuses there
+    (E142, E144) or cannot write shows at promote alone."""
+    rel = str(path.relative_to(ROOT))
+    need_slug(did)
+    if (BRIEFS / f"{did}.md").exists():
+        raise Refused(refusal("PARK-E204", f"briefs/{did}.md exists; a "
+                              f"promotion never overwrites a brief"))
+    lines = read_deposit(path)
+    m = parse_provenance(lines[0], rel)
+    need_bound(m["origin"], rel)
+    line = map_line(lines, rel)
+    survives(did, "task", [], line)
+    return lines, m, line
+
+
+def promoted_text(did: str, btype: str, triggers: list[str],
+                  lines: list[str], provenance: str, line: str) -> str:
+    rest = lines[2:]
+    while rest and not rest[0].strip():
+        rest = rest[1:]
+    body = provenance + "\n" + ("\n" + "\n".join(rest) + "\n" if rest else "")
+    return scaffold(did, btype, triggers, line, body)
+
+
+def with_candidate(did: str, text: str, loaded: dict, load_errors: list[str]):
+    """(the tree with this brief added, its path, every error in that tree):
+    what a promotion is judged by, since the brief may be what a gate needs."""
+    rel = BRIEFS.relative_to(ROOT) / f"{did}.md"
+    briefs, errors = dict(loaded), list(load_errors)
+    data = parse_text(rel, text, errors)
+    if data is not None:
+        data["_path"] = rel
+        briefs[did] = data
+    validate(briefs, errors)
+    return briefs, rel, errors
+
+
+def not_deposits(found: list[Path]) -> list[Path]:
+    """Each file waiting in the inbox that is no deposit: a regular file
+    directly in it, its name not opening with a dot, neither a deposit nor
+    the queue's README; the session-start hook names these as waiting too
+    (the 2026-11-04 review: `finding.txt` was named there, listed by nothing
+    and refused by `reject`, so nothing said how to clear it)."""
+    taken = set(found)
+    return sorted(p for p in INBOX.iterdir()
+                  if not p.name.startswith(".") and p not in taken
+                  and not is_queue_readme(p) and p.is_file())
 
 
 def intake_list(args) -> int:
@@ -934,19 +1245,28 @@ def intake_list(args) -> int:
         print(f"park: 0 deposit(s) ({where} does not exist)")
         return 0
     found = deposits()
-    print(f"park: {len(found)} deposit(s) in {where}")
+    others = not_deposits(found)
+    print(f"park: {len(found)} deposit(s) in {where}"
+          + (f", and {len(others)} file(s) that are not one" if others else ""))
+    load_errors: list[str] = []
+    loaded = load_briefs(load_errors) if found else {}
     for path in found:
-        rel = str(path.relative_to(ROOT))
         try:
-            lines = read_deposit(path)
-            m = parse_provenance(lines[0], rel)
-            line = map_line(lines, rel)
-            need_bound(m["origin"], rel)
+            lines, m, line = deposit_checks(path.stem, path)
+            text = promoted_text(path.stem, "task", [], lines,
+                                 lines[0].strip(), line)
+            errors = with_candidate(path.stem, text, loaded, load_errors)[2]
+            if errors:
+                raise Refused(refusal("PARK-E215", f"{len(errors)} error(s) "
+                                      f"with it added, first: {errors[0]}"))
             origin = m["origin"] or "none (promote needs --origin)"
             print(f"  {path.stem}  origin {origin}  {m['date']}  by "
                   f"{m['by']} — {line}")
         except Refused as exc:
             print(f"  {path.stem}  NOT PROMOTABLE: {exc.lines[0]}")
+    for path in others:
+        print(f"  {path.name}  NOT A DEPOSIT: only `<id>.md` is one; rename "
+              f"it to one to promote it, or remove it by hand")
     return 0
 
 
@@ -975,7 +1295,15 @@ def deposit_input(args) -> bytes:
             from None
 
 
+def need_tree() -> None:
+    """A deposit queues into a tree that exists; park never starts one."""
+    if not BRIEFS.is_dir():
+        raise Refused(refusal("PARK-E101", f"{BRIEFS.relative_to(ROOT)}/: "
+                                           f"directory does not exist"))
+
+
 def intake_deposit(args) -> int:
+    need_tree()
     reserved(args.id, "PARK-E216")
     need_slug(args.id)
     path = deposit_path(args.id)
@@ -992,7 +1320,7 @@ def intake_deposit(args) -> int:
     except UnicodeDecodeError:
         raise Refused(refusal("PARK-E205", "the deposit text is not UTF-8")) \
             from None
-    lines = text.splitlines()
+    lines = lines_of(text)
     if not lines or not lines[0].strip():
         raise Refused(refusal("PARK-E205", "the deposit text is empty, or "
                                            "its line 1 is blank"))
@@ -1003,32 +1331,58 @@ def intake_deposit(args) -> int:
                               f"({origin_words()})"))
     need_bound(m["origin"], "deposit", WRITE_HINT)
     survives(args.id, "task", [], map_line(lines, "deposit"))
-    issue = bound_origin(m["origin"])
-    # Only a github origin can be a duplicate; scanning for any other would
-    # let an unreadable, unrelated file refuse an analyst's deposit.
-    if issue is not None:
-        seen, legacy = recorded(github_records())
-        if issue in seen:
-            raise Refused(refusal("PARK-E213", f"{m['origin']} is already "
-                                  f"recorded in {seen[issue]}"))
-        if issue[1] in legacy:
-            raise Refused(unbound_conflict(legacy, *issue))
+    # The input is read before the lock, so a stdin nobody closes holds no
+    # one up; the checks the file's creation rests on are asked again under
+    # it, and the creation is made before it is released (S10-F5).
+    with tree_lock():
+        if path.exists():
+            raise Refused(refusal("PARK-E203", f"{rel} exists; a deposit is "
+                                               f"never overwritten"))
+        if (BRIEFS / f"{args.id}.md").exists():
+            raise Refused(refusal("PARK-E204", f"briefs/{args.id}.md exists; "
+                                               f"choose another id"))
+        need_unrecorded(m["origin"])
+        return deposit_write(path, rel, text, m["origin"])
+
+
+def need_unrecorded(origin: str | None, besides: Path | None = None) -> None:
+    """Refuse a GitHub origin some file other than `besides` already
+    records (E213), or that a 0.4.0 `github#N` origin could be recording
+    (E218). Only a github origin can be a duplicate; scanning for any other
+    would let an unreadable, unrelated file refuse an analyst's deposit.
+
+    The check half of one protected operation (S10-F5, the 2026-11-08
+    review): every caller holds `tree_lock` from this call until its file
+    is written — deposit, import and promotion alike — so two of them can
+    never both pass it on the old tree."""
+    issue = bound_origin(origin)
+    if issue is None:
+        return
+    seen, legacy = recorded([r for r in github_records()
+                             if r.path != besides])
+    if issue in seen:
+        raise Refused(refusal("PARK-E213", f"{origin} is already "
+                              f"recorded in {seen[issue]}"))
+    if issue[1] in legacy:
+        raise Refused(unbound_conflict(legacy, *issue))
+
+
+def deposit_write(path: Path, rel: str, text: str, origin: str) -> int:
     made: list[Path] = []
     new_dir = not INBOX.is_dir()
-    try:
-        INBOX.mkdir(parents=True, exist_ok=True)
-        create_file(path, text if text.endswith("\n") else text + "\n", made)
-    except OSError as exc:
-        rollback(made, {})
-        if new_dir:
-            try:
-                INBOX.rmdir()
-            except OSError:
-                pass
-        code = "PARK-E203" if isinstance(exc, FileExistsError) else "PARK-E214"
-        raise Refused(refusal(code, f"writing {rel} failed ({exc}); nothing "
-                                    f"was left behind")) from None
-    print(f"park: deposited {rel} (origin {m['origin']})")
+    with uninterrupted():
+        try:
+            INBOX.mkdir(parents=True, exist_ok=True)
+            create_file(path, text if text.endswith("\n") else text + "\n",
+                        made)
+        except OSError as exc:
+            left = drop_new_inbox(new_dir, rollback(made, {}))
+            code = ("PARK-E203" if isinstance(exc, FileExistsError)
+                    else "PARK-E214")
+            raise Refused(refusal(code, f"writing {rel} failed ({exc}); "
+                                        + undone(left, "nothing was left "
+                                                 "behind"))) from None
+        print(f"park: deposited {rel} (origin {origin})", flush=True)
     return 0
 
 
@@ -1040,11 +1394,7 @@ def intake_promote(args) -> int:
     if not path.is_file():
         raise Refused(refusal("PARK-E202", f"{rel} does not exist"))
     target = BRIEFS / f"{args.id}.md"
-    if target.exists():
-        raise Refused(refusal("PARK-E204", f"briefs/{args.id}.md exists; a "
-                              f"promotion never overwrites a brief"))
-    lines = read_deposit(path)
-    m = parse_provenance(lines[0], rel)
+    lines, m, line = deposit_checks(args.id, path)
     provenance = lines[0].strip()
     if m["origin"] is None:
         if args.origin is None:
@@ -1059,24 +1409,19 @@ def intake_promote(args) -> int:
     elif args.origin is not None:
         raise Refused(refusal("PARK-E209", f"{rel}: line 1 already declares "
                               f"origin {m['origin']}; drop --origin"))
-    need_bound(m["origin"], rel)
-    line = map_line(lines, rel)
+    # The brief inserts its origin as much as a deposit does — `--origin`
+    # adds one, and a deposit placed in the queue by hand never met
+    # `deposit`'s check — so it is checked against every OTHER file here,
+    # under the lock `run` holds for the whole promotion (S10-F5).
+    need_unrecorded(m["origin"] or args.origin, besides=path)
     triggers = list(args.trigger or [])
     survives(args.id, args.type, triggers, line)
-    rest = lines[2:]
-    while rest and not rest[0].strip():
-        rest = rest[1:]
-    body = provenance + "\n" + ("\n" + "\n".join(rest) + "\n" if rest else "")
-    text = scaffold(args.id, args.type, triggers, line, body)
+    text = promoted_text(args.id, args.type, triggers, lines, provenance, line)
 
-    errors: list[str] = []
-    briefs = load_briefs(errors)
-    brief_rel = BRIEFS.relative_to(ROOT) / f"{args.id}.md"
-    data = parse_text(brief_rel, text, errors)
-    if data is not None:
-        data["_path"] = brief_rel
-        briefs[args.id] = data
-    validate(briefs, errors)
+    load_errors: list[str] = []
+    loaded = load_briefs(load_errors)
+    briefs, brief_rel, errors = with_candidate(args.id, text, loaded,
+                                               load_errors)
     if errors:
         raise Refused(*errors, refusal("PARK-E215", f"{len(errors)} error(s) "
                                        f"with {brief_rel} added; nothing was "
@@ -1085,19 +1430,25 @@ def intake_promote(args) -> int:
 
     made: list[Path] = []
     restore: dict = {}
-    try:
-        create_file(target, text, made)
-        if current != want:
-            restore[TODO] = TODO.read_bytes() if TODO.is_file() else None
-            TODO.write_text(want, encoding="utf-8")
-        restore[path] = path.read_bytes()
-        path.unlink()
-    except OSError as exc:
-        rollback(made, restore)
-        raise Refused(refusal("PARK-E214", f"promoting {rel} failed "
-                              f"({exc}); every file was restored")) from None
-    print(f"park: promoted {rel} to {brief_rel} (type {args.type}, owner "
-          f"user); map written ({len(briefs)} briefs); deposit removed")
+    with uninterrupted():
+        try:
+            create_file(target, text, made)
+            if current != want:
+                restore[TODO] = TODO.read_bytes() if TODO.is_file() else None
+                write_atomic(TODO, want.encode("utf-8"))
+            restore[path] = path.read_bytes()
+            path.unlink()
+        except OSError as exc:
+            left = rollback(made, restore)
+            raise Refused(refusal("PARK-E214", f"promoting {rel} failed "
+                                  f"({exc}); " + undone(
+                                      left, "every file was restored"))) \
+                from None
+        # Said while still held, so an interrupt released next ends a run
+        # whose last line says the promotion is whole.
+        print(f"park: promoted {rel} to {brief_rel} (type {args.type}, owner "
+              f"user); map written ({len(briefs)} briefs); deposit removed",
+              flush=True)
     return 0
 
 
@@ -1150,12 +1501,11 @@ def intake_reject(args) -> int:
 # one without asking the forge anything about it, and reads each remaining
 # issue with `gh issue view`, planning a close only when the URL the forge
 # answers names that same repository and number. Only `--apply` writes to
-# the forge, one `gh issue close --comment` per planned issue. `--bind`
-# rewrites 0.4.0's `github#N` origins into the bound form, locally, from
-# the issue URL the import recorded below each one, or else from `--repo`.
+# the forge, one `gh issue close --comment` per planned issue.
 # No Project API is used, and nothing here runs on a schedule: every run is
-# someone's command. A rejected issue comes back on the next import unless
-# it is closed or filtered out with `--label`.
+# someone's command. An open issue with a comment stays on the forge unless
+# `--with-commented` asks for it. A rejected issue comes back on the next
+# import unless it is closed, commented or filtered out with `--label`.
 
 GH_TIMEOUT = 120
 
@@ -1210,7 +1560,8 @@ def is_issue(item) -> bool:
     return (isinstance(item, dict) and type(item.get("number")) is int
             and item["number"] > 0 and isinstance(item.get("title"), str)
             and url_names(item) is not None
-            and isinstance(item.get("body"), (str, type(None))))
+            and isinstance(item.get("body"), (str, type(None)))
+            and isinstance(item.get("comments"), list))
 
 
 def issue_id(number: int, title: str, repo: Repo | None = None,
@@ -1279,20 +1630,84 @@ def issue_line(number: int, title: str) -> str:
     return line
 
 
+def is_view(data) -> bool:
+    return (isinstance(data, dict) and isinstance(data.get("state"), str)
+            and isinstance(data.get("url"), str)
+            and issue_url(data["url"]) is not None)
+
+
+def gone_from_forge(exe: str, records: list[Record], listed: set,
+                    only: Repo | None) -> list[str]:
+    """One line per deposit or live brief whose issue is no longer open: the
+    list says only what is open and labelled, so each origin it left out is
+    read (the 2026-11-04 review: `bin/estate issues` closes issues itself). A
+    read that fails is said and stops nothing, the deposits being written."""
+    lines = []
+    for r in records:
+        issue = bound_origin(r.origin)
+        if issue is None or r.settled or issue in listed or (
+                only is not None and issue[0] != only):
+            continue
+        origin = r.origin
+        try:
+            state = gh_json(exe, ["issue", "view", str(issue[1]), "--json",
+                                  "number,state,url"], str(issue[0]),
+                            is_view)["state"]
+        except Refused as exc:
+            lines.append(f"  {origin} ({r.rel}): not read: {exc.lines[0]}")
+            continue
+        if state != "OPEN":
+            lines.append(f"  {origin} is {state.lower()} on the forge; "
+                         f"{r.rel} still records it")
+    return lines
+
+
 def github_inbound(args) -> int:
+    need_tree()
     exe = gh_path()
     fields = ["issue", "list", "--state", "open", "--limit", str(args.limit),
-              "--json", "number,title,body,url"]
+              "--json", "number,title,body,url,comments"]
     if args.label:
         fields += ["--label", args.label]
     issues = gh_json(exe, fields, args.repo,
                      lambda d: isinstance(d, list) and all(map(is_issue, d)))
+    # No forge call is made under the lock: what is held is the scan of
+    # recorded origins through the last file written (S10-F5), so no
+    # deposit, import or promotion can pass its own check on the tree this
+    # one is about to change.
+    with tree_lock():
+        records, plan, handed = inbound_write(issues, args)
+    names = ", ".join(p.stem for p, _ in plan) or "none"
+    print(f"park: {len(plan)} new deposit(s) from {len(issues)} open "
+          f"issue(s), {len(issues) - len(plan) - handed} already recorded"
+          + (f", {handed} left on the forge with a comment "
+             f"(--with-commented imports them)" if handed else "")
+          + f": {names}")
+    listed = {url_names(item) for item in issues}
+    only = REPO_ARG.fullmatch(args.repo) if args.repo else None
+    for line in gone_from_forge(exe, records, listed,
+                                Repo.of(only) if only else None):
+        print(line)
+    return 0
+
+
+def inbound_write(issues: list, args) -> tuple[list, list, int]:
+    """The inbound import's check-and-insert: the recorded origins, the
+    deposits planned from the issues none records, and those deposits
+    written. Returns (the records, the plan, how many were left handed
+    off)."""
     records = github_records()
     seen, legacy = recorded(records)
     origin_at = {r.path: r.origin for r in records}
     new = [(url_names(item), item)
            for item in sorted(issues, key=lambda i: i["number"])]
     new = [(issue, item) for issue, item in new if issue not in seen]
+    # A comment marks an issue handed off (estate-issues, ruling 5): it stays
+    # on the forge, and importing it would queue it a second time.
+    handed = 0 if args.with_commented else sum(
+        bool(item["comments"]) for _, item in new)
+    if not args.with_commented:
+        new = [(issue, item) for issue, item in new if not item["comments"]]
     # A 0.4.0 origin with the same number may be recording this very issue,
     # or another repository's: importing would risk a duplicate, skipping
     # would risk a loss, so neither is guessed at.
@@ -1313,22 +1728,16 @@ def github_inbound(args) -> int:
     made: list[Path] = []
     new_dir = not INBOX.is_dir()
     try:
-        INBOX.mkdir(parents=True, exist_ok=True)
+        if plan:
+            INBOX.mkdir(parents=True, exist_ok=True)
         for path, text in plan:
             create_file(path, text, made)
     except OSError as exc:
-        rollback(made, {})
-        if new_dir:
-            try:
-                INBOX.rmdir()
-            except OSError:
-                pass
+        left = drop_new_inbox(new_dir, rollback(made, {}))
         raise Refused(refusal("PARK-E214", f"writing the deposits failed "
-                              f"({exc}); none was left behind")) from None
-    names = ", ".join(p.stem for p, _ in plan) or "none"
-    print(f"park: {len(plan)} new deposit(s) from {len(issues)} open "
-          f"issue(s), {len(issues) - len(plan)} already recorded: {names}")
-    return 0
+                              f"({exc}); " + undone(
+                                  left, "none was left behind"))) from None
+    return records, plan, handed
 
 
 def github_outbound(args) -> int:
@@ -1352,17 +1761,13 @@ def github_outbound(args) -> int:
             unbound.append(refusal("PARK-E218", f"{b['_path']}: origin "
                                    f"{origin} names no repository, so its "
                                    f"issue can be closed in none; "
-                                   f"{BIND_HINT}"))
+                                   f"{EDIT_HINT.format(n=legacy_number(origin))}"))
     if unbound:
         raise Refused(*unbound)
     planned, skipped, moved = [], [], []
     for (repo, n), b in todo:
         data = gh_json(exe, ["issue", "view", str(n), "--json",
-                             "number,state,url"], args.repo,
-                       lambda d: isinstance(d, dict)
-                       and isinstance(d.get("state"), str)
-                       and isinstance(d.get("url"), str)
-                       and issue_url(d["url"]) is not None)
+                             "number,state,url"], args.repo, is_view)
         at = issue_url(data["url"])
         comment = (f"Closed by park: brief `{b['id']}` reached status done. "
                    f"{b['brief']}")
@@ -1407,137 +1812,24 @@ def github_outbound(args) -> int:
     return 0
 
 
-def rebound(text: str, index: int, n: int, repo: Repo) -> str | None:
-    """`text` with line `index`'s `github#n` origin, and nothing else,
-    rewritten to `repo`'s; None when that origin is not where it was read."""
-    lines = text.splitlines(keepends=True)
-    line = lines[index]
-    lead = len(line) - len(line.lstrip())
-    m = PROVENANCE.match(line[lead:])
-    old = f"github#{n}"
-    if m is None or m["origin"] is None:
-        return None
-    start = lead + m.start("origin")
-    if line[start:start + len(old)] != old:
-        return None
-    lines[index] = line[:start] + repo.origin(n) + line[start + len(old):]
-    if leading_origin(lines[index]) != repo.origin(n):
-        return None
-    return "".join(lines)
-
-
-def github_bind(args) -> int:
-    """The migration: every 0.4.0 `github#N` origin, bound to the repository
-    the issue URL recorded below it names (0.4.0's import wrote one), or,
-    for one that records none, to `--repo`. A plan by default; `--apply`
-    rewrites the origins and nothing else. No forge call: the proof is in
-    the files, or in the operator's `--repo`."""
-    dest: Repo | None = args.destination
-    records = github_records()
-    seen, _ = recorded(records)
-    problems: list[str] = []
-    plan = []
-    for r in records:
-        n = legacy_number(r.origin)
-        if n is None:
-            continue
-        proof = issue_url(r.evidence)
-        if proof is not None and proof[1] != n:
-            problems.append(refusal("PARK-E219", f"{r.rel}: origin github#{n}, "
-                                    f"but the issue URL recorded below it "
-                                    f"names #{proof[1]} ({r.evidence}); bind "
-                                    f"it by hand"))
-            continue
-        if proof is not None:
-            plan.append((r, proof[0], n, "its issue URL"))
-        elif dest is not None:
-            plan.append((r, dest, n, "--repo"))
-        else:
-            problems.append(refusal("PARK-E219", f"{r.rel}: origin github#{n} "
-                                    f"records no issue URL to prove its "
-                                    f"repository; name it with --repo "
-                                    f"OWNER/NAME"))
-    claimed: dict[tuple[Repo, int], str] = {}
-    writes = []
-    for r, repo, n, how in plan:
-        issue = (repo, n)
-        if issue in seen:
-            problems.append(refusal("PARK-E213", f"{r.rel}: github#{n} would "
-                                    f"bind to {repo.origin(n)}, already "
-                                    f"recorded in {seen[issue]}"))
-            continue
-        if issue in claimed:
-            problems.append(refusal("PARK-E219", f"{r.rel}: github#{n} would "
-                                    f"bind to {repo.origin(n)}, as "
-                                    f"{claimed[issue]} would; two origins "
-                                    f"cannot record one issue"))
-            continue
-        claimed[issue] = r.rel
-        code = "PARK-E217" if r.kind == "deposit" else "PARK-E102"
-        try:
-            raw = r.path.read_bytes()
-            text = raw.decode("utf-8")
-        except OSError as exc:
-            problems.append(refusal(code, f"{r.rel}: unreadable "
-                                    f"({exc.strerror or type(exc).__name__})"))
-            continue
-        except UnicodeDecodeError:
-            code = "PARK-E205" if r.kind == "deposit" else "PARK-E102"
-            problems.append(refusal(code, f"{r.rel}: not UTF-8 text, so it "
-                                    f"cannot be rewritten exactly; bind it "
-                                    f"by hand"))
-            continue
-        text = rebound(text, r.index, n, repo)
-        if text is None:
-            problems.append(refusal("PARK-E219", f"{r.rel}: github#{n} is not "
-                                    f"where it was read; re-run"))
-            continue
-        writes.append((r, raw, text.encode("utf-8"), repo, n, how))
-    if problems:
-        raise Refused(*problems)
-    print(f"park: bind — {len(writes)} github#N origin(s) to bind")
-    for r, _, _, repo, n, how in writes:
-        print(f"  bind {r.rel}: github#{n} -> {repo.origin(n)} ({how})")
-    if not args.apply:
-        print("park: plan only; nothing was written. Re-run with --apply to "
-              "rewrite these origins.")
-        return 0
-    restore: dict = {}
-    try:
-        for r, old, new, _, _, _ in writes:
-            restore[r.path] = old
-            r.path.write_bytes(new)
-    except OSError as exc:
-        rollback([], restore)
-        raise Refused(refusal("PARK-E214", f"binding failed ({exc}); every "
-                                           f"file was restored")) from None
-    print(f"park: applied — {len(writes)} origin(s) bound")
-    return 0
-
-
 def intake_github(args) -> int:
-    if args.outbound and args.bind:
-        raise Refused(refusal("PARK-E001", "--outbound and --bind are "
-                                           "separate runs"))
-    if args.apply and not (args.outbound or args.bind):
+    if args.apply and not args.outbound:
         raise Refused(refusal("PARK-E001", "--apply acts only with "
-                                           "--outbound or --bind"))
-    if (args.outbound or args.bind) and args.label:
-        raise Refused(refusal("PARK-E001", "--label filters the inbound "
-                                           "import only"))
+                                           "--outbound"))
+    if args.outbound and (args.label or args.with_commented):
+        raise Refused(refusal("PARK-E001", "--label and --with-commented "
+                                           "steer the inbound import only"))
     if args.outbound and args.repo is None:
         raise Refused(refusal("PARK-E001", "--outbound needs --repo "
                               "[HOST/]OWNER/NAME, the repository whose issues "
                               "it closes"))
     args.destination = None
-    if args.repo is not None and (args.outbound or args.bind):
+    if args.repo is not None and args.outbound:
         m = REPO_ARG.fullmatch(args.repo)
         if m is None:
             raise Refused(refusal("PARK-E001", f"--repo {args.repo!r} is not "
                                   f"[HOST/]OWNER/NAME"))
         args.destination = Repo.of(m)
-    if args.bind:
-        return github_bind(args)
     return github_outbound(args) if args.outbound else github_inbound(args)
 
 
@@ -1556,13 +1848,14 @@ def build_parser() -> Parser:
     parser.add_argument("--version", action="version",
                         version=f"park {PARK_VERSION}")
     sub = parser.add_subparsers(dest="verb", required=True)
-    sub.add_parser("validate")
-    p_map = sub.add_parser("map")
+    sub.add_parser("validate", help="check every brief under briefs/")
+    p_map = sub.add_parser("map", help="validate, then compile TODO.md")
     p_map.add_argument("--check", action="store_true",
                        help="compare instead of writing; non-zero on drift")
     p_in = sub.add_parser("intake", help="the deposit queue, briefs/inbox/")
     verbs = p_in.add_subparsers(dest="intake", required=True)
-    verbs.add_parser("list", help="every deposit, and whether it promotes")
+    verbs.add_parser("list", help="every deposit and what promote's checks "
+                     "say of it, and each file there that is not one")
     p_dep = verbs.add_parser("deposit", help="create briefs/inbox/ID.md from "
                              "stdin or --file; never overwrites")
     p_dep.add_argument("id")
@@ -1579,14 +1872,18 @@ def build_parser() -> Parser:
     p_rej.add_argument("id")
     p_rej.add_argument("--reason", required=True)
     p_gh = verbs.add_parser("github", help="open issues -> deposits; "
-                            "--outbound plans the closes, --bind the binding "
-                            "of 0.4.0 origins; --apply makes either")
-    p_gh.add_argument("--repo", metavar="REPOSITORY")
-    p_gh.add_argument("--label")
-    p_gh.add_argument("--limit", type=issue_limit, default=100)
-    p_gh.add_argument("--outbound", action="store_true")
-    p_gh.add_argument("--bind", action="store_true")
-    p_gh.add_argument("--apply", action="store_true")
+                            "--outbound plans the closes, --apply makes them")
+    p_gh.add_argument("--repo", metavar="REPOSITORY",
+                      help="[HOST/]OWNER/NAME; outbound requires it")
+    p_gh.add_argument("--label", help="import only issues with this label")
+    p_gh.add_argument("--limit", type=issue_limit, default=100,
+                      help="import at most this many issues, 1 to 1000")
+    p_gh.add_argument("--with-commented", action="store_true",
+                      help="also import an open issue that has a comment")
+    p_gh.add_argument("--outbound", action="store_true",
+                      help="plan closing issues whose brief is done")
+    p_gh.add_argument("--apply", action="store_true",
+                      help="with --outbound, make those closes")
     return parser
 
 
@@ -1602,15 +1899,37 @@ INTAKE = {"list": intake_list, "deposit": intake_deposit,
 
 
 def main(argv=None) -> int:
+    try:
+        return run(argv)
+    except KeyboardInterrupt:
+        return interrupted()
+
+
+def run(argv) -> int:
     args = build_parser().parse_args(argv)
+    if not ROOT.is_absolute():          # `find_root`: the directory is gone
+        print(refusal("PARK-E101", "the working directory no longer exists, "
+                      "so no `briefs/` can be looked for above it; change to "
+                      "the repository and run again"), file=sys.stderr)
+        return 1
     if args.verb == "intake":
         try:
+            if args.intake == "promote":    # the index is read, then rewritten
+                with tree_lock():
+                    return intake_promote(args)
             return INTAKE[args.intake](args)
         except Refused as exc:
             for line in exc.lines:
                 print(line, file=sys.stderr)
             return 2 if exc.lines[-1].startswith("PARK-E001") else 1
 
+    # A reader holds it shared: mid-promote the brief exists and the index
+    # does not yet name it, which `--check` would call drift.
+    with tree_lock(shared=args.verb == "validate" or args.check):
+        return tree_verb(args)
+
+
+def tree_verb(args) -> int:
     errors: list[str] = []
     briefs = load_briefs(errors)
     validate(briefs, errors)
@@ -1646,28 +1965,11 @@ def main(argv=None) -> int:
         print(f"park: map already current ({len(briefs)} briefs)")
         return 0
     try:
-        before = TODO.read_bytes() if TODO.is_file() else None
+        write_atomic(TODO, want.encode("utf-8"))
     except OSError as exc:
-        print(refusal("PARK-E142", f"{TODO.name}: unreadable ({exc})"),
-              file=sys.stderr)
-        return 1
-    try:
-        TODO.write_text(want, encoding="utf-8")
-    except OSError as exc:
-        # Put back what a write that failed partway may have truncated; a
-        # write refused at open (a read-only file or directory) changed
-        # nothing, and the restore then fails the same way, harmlessly.
-        rollback([], {TODO: before})
-        try:
-            unchanged = (TODO.read_bytes() if TODO.is_file()
-                         else None) == before
-        except OSError:
-            unchanged = False
-        state = ("it is unchanged" if unchanged else "it may be partly "
-                 "written; run `park map` again once it can be written")
         print(refusal("PARK-E143", f"{TODO.name}: cannot be written "
-                      f"({exc.strerror or type(exc).__name__}); {state}"),
-              file=sys.stderr)
+                      f"({exc.strerror or type(exc).__name__}); it is "
+                      f"unchanged"), file=sys.stderr)
         return 1
     print(f"park: map written ({len(briefs)} briefs)")
     return 0
